@@ -1,0 +1,32 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Python caches / virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local tool state
+.codex/
+codex_home/
+
+# Runtime data (generated at run time)
+data/sessions.sqlite3
+data/patched_bot.log
+data/uploads/
+data/generated/
+data/code-backup-*/
+data/**/__pycache__/
+data/**/*.pyc
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
