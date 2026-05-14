@@ -11,9 +11,18 @@ from typing import Optional, Set
 
 from dotenv import load_dotenv
 from telegram import Message, Update
+from telegram.constants import ChatAction
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.ext import MessageHandler, filters
+
+TASK_DEFAULT = "default"
+TASK_CODE = "code"
+TASK_SURVEY = "survey"
+AGENT_CODEX = "codex"
+AGENT_CLAUDE = "claude"
+AGENT_GEMINI = "gemini"
+SUPPORTED_AGENTS = (AGENT_CODEX, AGENT_CLAUDE, AGENT_GEMINI)
 
 
 def parse_id_set(raw: str) -> Set[int]:
@@ -124,6 +133,87 @@ def collect_file_state(root_dir: Path) -> dict[str, tuple[int, int]]:
     return state
 
 
+def truncate_for_prompt(text: str, max_chars: int = 12000) -> str:
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars]
+    return clipped + "\n\n[Truncated due to size limit]"
+
+
+def looks_like_code_content(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+
+    if "```" in text:
+        return True
+
+    code_patterns = [
+        r"\bdef\s+\w+\s*\(",
+        r"\bclass\s+\w+",
+        r"\bimport\s+\w+",
+        r"\bfrom\s+\w+\s+import\b",
+        r"\bfunction\s+\w+\s*\(",
+        r"\bconst\s+\w+\s*=",
+        r"\blet\s+\w+\s*=",
+        r"\bvar\s+\w+\s*=",
+        r"\bSELECT\b.+\bFROM\b",
+        r"\bpublic\s+static\s+void\s+main\b",
+        r"\bconsole\.log\s*\(",
+        r"\bTraceback\b",
+        r"\bException\b",
+        r"\bpytest\b",
+    ]
+    for pattern in code_patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
+            return True
+
+    if re.search(r"\b\w+\.(py|js|ts|tsx|java|go|rs|cpp|c|cs|sql|sh|yaml|yml|json|toml)\b", text):
+        return True
+
+    return False
+
+
+def is_survey_request(user_text: str) -> bool:
+    lowered = user_text.lower()
+    survey_keywords = [
+        "조사",
+        "리서치",
+        "research",
+        "survey",
+        "서베이",
+        "검색해",
+        "찾아봐",
+        "웹서칭",
+        "논문",
+        "arxiv",
+    ]
+    return any(token in lowered for token in survey_keywords)
+
+
+def classify_task(user_text: str) -> str:
+    if looks_like_code_content(user_text):
+        return TASK_CODE
+    if is_survey_request(user_text):
+        return TASK_SURVEY
+    return TASK_DEFAULT
+
+
+def strip_cli_noise(text: str) -> str:
+    noise_prefixes = (
+        "Warning: True color",
+        "Ripgrep is not available",
+        "YOLO mode is enabled.",
+        "Reading additional input from stdin",
+    )
+    lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith(noise_prefixes):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 class SessionStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -142,6 +232,36 @@ class SessionStore:
                     thread_id TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_models (
+                    chat_id INTEGER PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_agent_models (
+                    chat_id INTEGER NOT NULL,
+                    agent TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, agent)
+                )
+                """
+            )
+            # Backfill legacy codex overrides if present.
+            conn.execute(
+                """
+                INSERT INTO chat_agent_models (chat_id, agent, model, updated_at)
+                SELECT chat_id, 'codex', model, updated_at
+                FROM chat_models
+                WHERE 1
+                ON CONFLICT(chat_id, agent) DO NOTHING
                 """
             )
             conn.commit()
@@ -179,18 +299,88 @@ class SessionStore:
             conn.commit()
             return cursor.rowcount > 0
 
+    @staticmethod
+    def _validate_agent(agent: str) -> str:
+        normalized = agent.strip().lower()
+        if normalized not in SUPPORTED_AGENTS:
+            raise ValueError(f"unsupported agent: {agent}")
+        return normalized
+
+    def get_agent_model(self, chat_id: int, agent: str) -> Optional[str]:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT model FROM chat_agent_models WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            ).fetchone()
+        if row is None:
+            return None
+        model = str(row[0]).strip()
+        return model if model else None
+
+    def set_agent_model(self, chat_id: int, agent: str, model: str) -> None:
+        normalized_agent = self._validate_agent(agent)
+        normalized_model = model.strip()
+        if not normalized_model:
+            raise ValueError("model must not be empty")
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_agent_models (chat_id, agent, model, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, agent) DO UPDATE SET
+                    model = excluded.model,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, normalized_agent, normalized_model),
+            )
+            conn.commit()
+
+    def clear_agent_model(self, chat_id: int, agent: str) -> bool:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM chat_agent_models WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_chat_model(self, chat_id: int) -> Optional[str]:
+        model = self.get_agent_model(chat_id, AGENT_CODEX)
+        if model:
+            return model
+
+        # Legacy fallback for old DB rows before migration.
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT model FROM chat_models WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        model = str(row[0]).strip()
+        return model if model else None
+
+    def set_chat_model(self, chat_id: int, model: str) -> None:
+        self.set_agent_model(chat_id, AGENT_CODEX, model)
+
+    def clear_chat_model(self, chat_id: int) -> bool:
+        return self.clear_agent_model(chat_id, AGENT_CODEX)
+
 
 class CodexRunner:
     def __init__(
         self,
         codex_bin: str,
-        model: str,
+        default_model: str,
         extra_args: list[str],
         workdir: Path,
         timeout_sec: int,
     ) -> None:
         self.codex_bin = codex_bin
-        self.model = model.strip()
+        self.default_model = default_model.strip()
         self.extra_args = extra_args
         self.workdir = workdir
         self.timeout_sec = timeout_sec
@@ -200,6 +390,7 @@ class CodexRunner:
         prompt: str,
         thread_id: Optional[str],
         output_last_message_path: str,
+        model: str,
     ) -> list[str]:
         if thread_id:
             cmd = [
@@ -221,8 +412,8 @@ class CodexRunner:
                 output_last_message_path,
             ]
 
-        if self.model:
-            cmd.extend(["--model", self.model])
+        if model:
+            cmd.extend(["--model", model])
         cmd.extend(self.extra_args)
 
         if thread_id:
@@ -231,12 +422,18 @@ class CodexRunner:
             cmd.append(prompt)
         return cmd
 
-    async def run_prompt(self, prompt: str, thread_id: Optional[str]) -> tuple[str, Optional[str]]:
+    async def run_prompt(
+        self,
+        prompt: str,
+        thread_id: Optional[str],
+        model: Optional[str] = None,
+    ) -> tuple[str, Optional[str]]:
         output_fd, output_path = tempfile.mkstemp(prefix="codex-last-message-", suffix=".txt")
         os.close(output_fd)
 
         try:
-            cmd = self._build_command(prompt, thread_id, output_path)
+            resolved_model = (model or "").strip() or self.default_model
+            cmd = self._build_command(prompt, thread_id, output_path, model=resolved_model)
             env = dict(os.environ)
             env.setdefault("NO_COLOR", "1")
 
@@ -271,12 +468,88 @@ class CodexRunner:
             if not reply_text:
                 reply_text = "Codex returned no text output."
 
-            return reply_text, new_thread_id
+            return strip_cli_noise(reply_text), new_thread_id
         finally:
             try:
                 os.remove(output_path)
             except OSError:
                 pass
+
+
+class CliTextRunner:
+    def __init__(
+        self,
+        label: str,
+        cli_bin: str,
+        default_model: str,
+        extra_args: list[str],
+        workdir: Path,
+        timeout_sec: int,
+        base_args: list[str],
+    ) -> None:
+        self.label = label
+        self.cli_bin = cli_bin
+        self.default_model = default_model.strip()
+        self.extra_args = extra_args
+        self.workdir = workdir
+        self.timeout_sec = timeout_sec
+        self.base_args = list(base_args)
+
+    def _build_command(self, prompt: str, model: Optional[str] = None) -> list[str]:
+        cmd = [self.cli_bin, *self.base_args]
+        resolved_model = (model or "").strip() or self.default_model
+        if resolved_model:
+            if self.label == "gemini":
+                cmd.extend(["-m", resolved_model])
+            else:
+                cmd.extend(["--model", resolved_model])
+        cmd.extend(self.extra_args)
+        if self.label == "gemini":
+            cmd.extend(["-p", prompt])
+        else:
+            cmd.append(prompt)
+        return cmd
+
+    async def run_prompt(self, prompt: str, model: Optional[str] = None) -> str:
+        cmd = self._build_command(prompt=prompt, model=model)
+        env = dict(os.environ)
+        env.setdefault("NO_COLOR", "1")
+        if self.label == "gemini":
+            env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self.workdir),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=self.timeout_sec
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise RuntimeError(f"{self.label} command timed out after {self.timeout_sec}s")
+
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            err = stderr_text.strip() or stdout_text.strip() or f"Unknown {self.label} error"
+            raise RuntimeError(err)
+
+        cleaned = strip_cli_noise(stdout_text)
+        if cleaned:
+            return cleaned
+
+        fallback = strip_cli_noise(stderr_text)
+        if fallback:
+            return fallback
+
+        return f"{self.label} returned no text output."
 
 
 class TelegramCodexBot:
@@ -288,7 +561,7 @@ class TelegramCodexBot:
             level=getattr(logging, log_level, logging.INFO),
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
-        self.logger = logging.getLogger("telegram-codex-bot")
+        self.logger = logging.getLogger("telegram-cerberus-bot")
 
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not telegram_token:
@@ -301,12 +574,14 @@ class TelegramCodexBot:
 
         db_path = Path(os.getenv("SESSION_DB_PATH", "./data/sessions.sqlite3")).expanduser()
         self.sessions = SessionStore(db_path)
+
         self.upload_dir = Path(os.getenv("UPLOAD_DIR", "./data/uploads")).expanduser().resolve()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.generated_files_dir = Path(
             os.getenv("GENERATED_FILES_DIR", "./data/generated")
         ).expanduser().resolve()
         self.generated_files_dir.mkdir(parents=True, exist_ok=True)
+
         self.max_return_files = parse_positive_int(
             os.getenv("MAX_RETURN_FILES", "5"),
             default=5,
@@ -320,22 +595,80 @@ class TelegramCodexBot:
         self.max_return_file_size_bytes = self.max_return_file_size_mb * 1024 * 1024
 
         codex_bin = os.getenv("CODEX_BIN", "codex").strip() or "codex"
-        codex_model = os.getenv("CODEX_MODEL", "").strip()
+        codex_model = os.getenv("CODEX_MODEL", "gpt-5.5").strip()
         codex_extra_args = shlex.split(os.getenv("CODEX_EXTRA_ARGS", ""))
         codex_workdir = Path(os.getenv("CODEX_WORKDIR", ".")).expanduser().resolve()
         codex_timeout = int(os.getenv("CODEX_TIMEOUT_SEC", "300"))
+
+        claude_bin = os.getenv("CLAUDE_BIN", "claude").strip() or "claude"
+        claude_model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
+        claude_extra_args = shlex.split(os.getenv("CLAUDE_EXTRA_ARGS", ""))
+        claude_timeout = int(os.getenv("CLAUDE_TIMEOUT_SEC", str(codex_timeout)))
+        claude_permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits").strip()
+        is_root_user = hasattr(os, "geteuid") and os.geteuid() == 0
+        if claude_permission_mode == "bypassPermissions" and is_root_user:
+            self.logger.warning(
+                "CLAUDE_PERMISSION_MODE=bypassPermissions is unsupported as root; "
+                "falling back to acceptEdits."
+            )
+            claude_permission_mode = "acceptEdits"
+
+        gemini_bin = os.getenv("GEMINI_BIN", "gemini").strip() or "gemini"
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview").strip()
+        gemini_extra_args = shlex.split(os.getenv("GEMINI_EXTRA_ARGS", ""))
+        gemini_timeout = int(os.getenv("GEMINI_TIMEOUT_SEC", str(codex_timeout)))
+        gemini_approval_mode = os.getenv("GEMINI_APPROVAL_MODE", "yolo").strip()
+
         telegram_api_timeout = float(os.getenv("TELEGRAM_API_TIMEOUT_SEC", "30"))
         telegram_send_retries = int(os.getenv("TELEGRAM_SEND_RETRIES", "3"))
         telegram_send_retry_delay = float(os.getenv("TELEGRAM_SEND_RETRY_DELAY_SEC", "1.0"))
 
-        self.runner = CodexRunner(
+        self.codex_runner = CodexRunner(
             codex_bin=codex_bin,
-            model=codex_model,
+            default_model=codex_model,
             extra_args=codex_extra_args,
             workdir=codex_workdir,
             timeout_sec=codex_timeout,
         )
+
+        claude_base_args = ["-p", "--output-format", "text"]
+        if claude_permission_mode:
+            claude_base_args.extend(["--permission-mode", claude_permission_mode])
+
+        self.claude_runner = CliTextRunner(
+            label="claude",
+            cli_bin=claude_bin,
+            default_model=claude_model,
+            extra_args=claude_extra_args,
+            workdir=codex_workdir,
+            timeout_sec=claude_timeout,
+            base_args=claude_base_args,
+        )
+
+        gemini_base_args = ["--output-format", "text"]
+        if gemini_approval_mode:
+            gemini_base_args.extend(["--approval-mode", gemini_approval_mode])
+
+        self.gemini_runner = CliTextRunner(
+            label="gemini",
+            cli_bin=gemini_bin,
+            default_model=gemini_model,
+            extra_args=gemini_extra_args,
+            workdir=codex_workdir,
+            timeout_sec=gemini_timeout,
+            base_args=gemini_base_args,
+        )
+
         self.codex_timeout_sec = codex_timeout
+        self.codex_workdir = codex_workdir
+        self.claude_timeout_sec = claude_timeout
+        self.gemini_timeout_sec = gemini_timeout
+        self.default_model_by_agent = {
+            AGENT_CODEX: self.codex_runner.default_model,
+            AGENT_CLAUDE: self.claude_runner.default_model,
+            AGENT_GEMINI: self.gemini_runner.default_model,
+        }
+
         self.telegram_api_timeout = max(telegram_api_timeout, 1.0)
         self.telegram_send_retries = max(telegram_send_retries, 0)
         self.telegram_send_retry_delay = max(telegram_send_retry_delay, 0.1)
@@ -382,6 +715,24 @@ class TelegramCodexBot:
 
     async def _reply_update_text(self, update: Update, text: str) -> bool:
         return await self._safe_reply_text(update.effective_message, text)
+
+    async def _send_typing_action(self, update: Update) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        try:
+            await message.reply_chat_action(action=ChatAction.TYPING)
+        except Exception:
+            # Typing indicator failures should not affect main request handling.
+            self.logger.debug("typing action failed", exc_info=True)
+
+    async def _typing_heartbeat(self, update: Update, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await self._send_typing_action(update)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                continue
 
     async def _safe_reply_document(
         self,
@@ -443,23 +794,163 @@ class TelegramCodexBot:
     ) -> bool:
         return await self._safe_reply_document(update.effective_message, file_path, caption)
 
-    def _build_prompt(self, thread_id: Optional[str], user_text: str, artifact_dir: Path) -> str:
-        runtime_context = (
+    def _runtime_context(self, artifact_dir: Path) -> str:
+        return (
             "[Runtime context]\n"
-            f"- codex_workdir={self.runner.workdir}\n"
+            f"- codex_workdir={self.codex_workdir}\n"
             f"- artifact_dir={artifact_dir}\n"
-            "- If the user asks for a file output, create the file in artifact_dir "
-            "and mention the path in your response."
+            "- If a file output is requested, create it under artifact_dir and mention the path."
+        )
+
+    def _build_codex_direct_prompt(
+        self,
+        thread_id: Optional[str],
+        user_text: str,
+        artifact_dir: Path,
+    ) -> str:
+        body = (
+            f"{self._runtime_context(artifact_dir)}\n\n"
+            "[User request]\n"
+            f"{user_text}"
         )
         if not thread_id and self.system_prompt:
             return (
                 "[System instruction]\n"
                 f"{self.system_prompt}\n\n"
-                f"{runtime_context}\n\n"
-                "[User message]\n"
-                f"{user_text}"
+                f"{body}"
             )
-        return f"{runtime_context}\n\n[User message]\n{user_text}"
+        return body
+
+    def _build_codex_coding_prompt(
+        self,
+        thread_id: Optional[str],
+        user_text: str,
+        artifact_dir: Path,
+    ) -> str:
+        instructions = (
+            "[Role]\n"
+            "You are the Codex implementation stage in a 3-agent pipeline.\n"
+            "Your job: implement the user's coding request directly in the workspace, run minimal validation, and summarize concrete changes.\n"
+            "Do not skip implementation unless blocked."
+        )
+        body = (
+            f"{instructions}\n\n"
+            f"{self._runtime_context(artifact_dir)}\n\n"
+            "[User request]\n"
+            f"{user_text}"
+        )
+
+        if not thread_id and self.system_prompt:
+            return (
+                "[System instruction]\n"
+                f"{self.system_prompt}\n\n"
+                f"{body}"
+            )
+        return body
+
+    def _build_codex_survey_prompt(self, user_text: str, artifact_dir: Path) -> str:
+        return (
+            "[Role]\n"
+            "You are Codex collector for survey task.\n"
+            "Collect high-value facts and output only structured sections.\n"
+            "If source verification is weak, state uncertainty explicitly.\n\n"
+            f"{self._runtime_context(artifact_dir)}\n\n"
+            "[Required output]\n"
+            "1) Key Findings\n"
+            "2) Evidence (bullet list with source title + URL + date if available)\n"
+            "3) Open Risks / Uncertainty\n"
+            "4) Confidence (0-100)\n\n"
+            "[User request]\n"
+            f"{user_text}"
+        )
+
+    def _build_claude_coding_review_prompt(
+        self,
+        user_text: str,
+        codex_result: str,
+        artifact_dir: Path,
+    ) -> str:
+        return (
+            "You are Claude review-and-fix stage in a coding pipeline.\n"
+            "Inputs:\n"
+            "- User request\n"
+            "- Codex implementation summary\n\n"
+            "Task:\n"
+            "1) Review codex output for bugs, regressions, and missing validation.\n"
+            "2) Apply required fixes directly in workspace when needed.\n"
+            "3) Run or propose focused checks.\n"
+            "4) Return concise report with sections:\n"
+            "- Findings\n"
+            "- Fixes Applied\n"
+            "- Remaining Risks\n"
+            "- Final Status\n\n"
+            f"artifact_dir={artifact_dir}\n\n"
+            "[User request]\n"
+            f"{user_text}\n\n"
+            "[Codex implementation summary]\n"
+            f"{truncate_for_prompt(codex_result)}"
+        )
+
+    def _build_gemini_coding_assist_prompt(
+        self,
+        user_text: str,
+        codex_result: str,
+        claude_result: str,
+    ) -> str:
+        return (
+            "You are Gemini assist stage in a coding pipeline.\n"
+            "Do not rewrite the full solution. Provide high-leverage assistance only.\n"
+            "Output sections:\n"
+            "- Edge Cases\n"
+            "- Test Ideas\n"
+            "- Simplification Opportunities\n"
+            "- Confidence (0-100)\n\n"
+            "[User request]\n"
+            f"{user_text}\n\n"
+            "[Codex summary]\n"
+            f"{truncate_for_prompt(codex_result, 8000)}\n\n"
+            "[Claude review/fix]\n"
+            f"{truncate_for_prompt(claude_result, 8000)}"
+        )
+
+    def _build_gemini_survey_prompt(self, user_text: str) -> str:
+        return (
+            "You are Gemini collector in a two-collector plus one-validator pipeline.\n"
+            "Task type: survey\n"
+            "Return only:\n"
+            "1) Key Findings\n"
+            "2) Evidence (source title + URL + date)\n"
+            "3) Open Risks / Uncertainty\n"
+            "4) Confidence (0-100)\n\n"
+            "[User request]\n"
+            f"{user_text}"
+        )
+
+    def _build_claude_validation_prompt(
+        self,
+        user_text: str,
+        codex_result: str,
+        gemini_result: str,
+    ) -> str:
+        return (
+            "You are Claude final validator and judge.\n"
+            "Task type: survey\n"
+            "You are given two independent collector outputs (Codex and Gemini).\n"
+            "Cross-check them, resolve conflicts, and produce the best final answer.\n"
+            "When uncertain, explicitly say uncertain.\n\n"
+            "Output sections:\n"
+            "1) Final Answer\n"
+            "2) Verified Facts\n"
+            "3) Conflicts and Resolution\n"
+            "4) Sources (URL list)\n"
+            "5) Residual Uncertainty\n\n"
+            "[User request]\n"
+            f"{user_text}\n\n"
+            "[Codex collector]\n"
+            f"{truncate_for_prompt(codex_result)}\n\n"
+            "[Gemini collector]\n"
+            f"{truncate_for_prompt(gemini_result)}"
+        )
 
     def _select_artifacts_to_send(
         self,
@@ -519,27 +1010,219 @@ class TelegramCodexBot:
                 "Some generated files were not sent: " + ", ".join(details),
             )
 
-    async def _run_codex_for_chat(self, update: Update, chat_id: int, user_text: str) -> None:
+    @staticmethod
+    def _normalize_agent_name(token: str) -> Optional[str]:
+        normalized = token.strip().lower()
+        if normalized in SUPPORTED_AGENTS:
+            return normalized
+        return None
+
+    def _resolve_agent_model_for_chat(self, chat_id: int, agent: str) -> tuple[str, str]:
+        normalized_agent = self._normalize_agent_name(agent)
+        if normalized_agent is None:
+            return "", "unsupported_agent"
+
+        chat_model = self.sessions.get_agent_model(chat_id, normalized_agent)
+        if chat_model:
+            return chat_model, "chat_override"
+
+        default_model = self.default_model_by_agent.get(normalized_agent, "").strip()
+        if default_model:
+            return default_model, f"{normalized_agent.upper()}_MODEL"
+
+        return "", f"{normalized_agent}_default"
+
+    def _format_model_status(self, chat_id: int) -> str:
+        lines: list[str] = []
+        for agent in SUPPORTED_AGENTS:
+            effective_model, source = self._resolve_agent_model_for_chat(chat_id, agent)
+            override_model = self.sessions.get_agent_model(chat_id, agent)
+            default_model = self.default_model_by_agent.get(agent, "")
+
+            lines.extend(
+                [
+                    f"[{agent}]",
+                    f"effective_model={effective_model or '(none)'}",
+                    f"effective_source={source}",
+                    f"chat_override={override_model or '(none)'}",
+                    f"default_env_model={default_model or '(none)'}",
+                    "",
+                ]
+            )
+
+        lines.append("usage: /model <name> (legacy: codex)")
+        lines.append("usage: /model <agent> <name> | /model <agent> clear")
+        return "\n".join(lines)
+
+    async def _run_coding_pipeline(self, update: Update, chat_id: int, user_text: str) -> str:
         artifact_dir = self.generated_files_dir / str(chat_id)
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        before_state = collect_file_state(artifact_dir)
 
         thread_id = self.sessions.get_thread_id(chat_id)
-        prompt = self._build_prompt(
+        codex_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
+        claude_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
+        gemini_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+
+        codex_prompt = self._build_codex_coding_prompt(
             thread_id=thread_id,
             user_text=user_text,
             artifact_dir=artifact_dir,
         )
 
-        try:
-            reply_text, new_thread_id = await self.runner.run_prompt(prompt=prompt, thread_id=thread_id)
-        except Exception as exc:
-            self.logger.exception("codex execution failed")
-            await self._reply_update_text(update, f"Codex execution failed: {exc}")
-            return
-
+        codex_result, new_thread_id = await self.codex_runner.run_prompt(
+            prompt=codex_prompt,
+            thread_id=thread_id,
+            model=codex_model,
+        )
         if new_thread_id:
             self.sessions.set_thread_id(chat_id, new_thread_id)
+
+        claude_prompt = self._build_claude_coding_review_prompt(
+            user_text=user_text,
+            codex_result=codex_result,
+            artifact_dir=artifact_dir,
+        )
+        claude_result = await self.claude_runner.run_prompt(claude_prompt, model=claude_model)
+
+        gemini_prompt = self._build_gemini_coding_assist_prompt(
+            user_text=user_text,
+            codex_result=codex_result,
+            claude_result=claude_result,
+        )
+        gemini_result = await self.gemini_runner.run_prompt(gemini_prompt, model=gemini_model)
+
+        return (
+            "[Routing]\n"
+            "category=code\n"
+            "pipeline=codex(implement) -> claude(review/fix) -> gemini(assist)\n\n"
+            "[Codex]\n"
+            f"{codex_result}\n\n"
+            "[Claude]\n"
+            f"{claude_result}\n\n"
+            "[Gemini]\n"
+            f"{gemini_result}"
+        )
+
+    async def _run_codex_direct(self, chat_id: int, user_text: str) -> str:
+        artifact_dir = self.generated_files_dir / str(chat_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        thread_id = self.sessions.get_thread_id(chat_id)
+        codex_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
+        prompt = self._build_codex_direct_prompt(
+            thread_id=thread_id,
+            user_text=user_text,
+            artifact_dir=artifact_dir,
+        )
+        reply_text, new_thread_id = await self.codex_runner.run_prompt(
+            prompt=prompt,
+            thread_id=thread_id,
+            model=codex_model,
+        )
+        if new_thread_id:
+            self.sessions.set_thread_id(chat_id, new_thread_id)
+        return reply_text
+
+    async def _run_survey_pipeline(self, update: Update, chat_id: int, user_text: str) -> str:
+        del update
+        artifact_dir = self.generated_files_dir / str(chat_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        codex_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
+        claude_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
+        gemini_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+        codex_prompt = self._build_codex_survey_prompt(user_text=user_text, artifact_dir=artifact_dir)
+        gemini_prompt = self._build_gemini_survey_prompt(user_text=user_text)
+
+        codex_task = self.codex_runner.run_prompt(
+            prompt=codex_prompt,
+            thread_id=None,
+            model=codex_model,
+        )
+        gemini_task = self.gemini_runner.run_prompt(gemini_prompt, model=gemini_model)
+
+        codex_result = ""
+        gemini_result = ""
+
+        codex_exc: Optional[BaseException] = None
+        gemini_exc: Optional[BaseException] = None
+
+        codex_out, gemini_out = await asyncio.gather(codex_task, gemini_task, return_exceptions=True)
+
+        if isinstance(codex_out, Exception):
+            codex_exc = codex_out
+            self.logger.warning("survey codex collector failed: %s", codex_exc)
+        else:
+            codex_result = codex_out[0]
+
+        if isinstance(gemini_out, Exception):
+            gemini_exc = gemini_out
+            self.logger.warning("survey gemini collector failed: %s", gemini_exc)
+        else:
+            gemini_result = gemini_out
+
+        if codex_exc and gemini_exc:
+            raise RuntimeError(
+                f"collector failed: codex={codex_exc}; gemini={gemini_exc}"
+            )
+
+        if not codex_result:
+            codex_result = f"Codex collector failed: {codex_exc}"
+        if not gemini_result:
+            gemini_result = f"Gemini collector failed: {gemini_exc}"
+
+        claude_prompt = self._build_claude_validation_prompt(
+            user_text=user_text,
+            codex_result=codex_result,
+            gemini_result=gemini_result,
+        )
+        claude_result = await self.claude_runner.run_prompt(claude_prompt, model=claude_model)
+
+        return (
+            "[Routing]\n"
+            "category=survey\n"
+            "pipeline=gemini+codex(collect) -> claude(validate/judge)\n\n"
+            "[Final by Claude]\n"
+            f"{claude_result}"
+        )
+
+    async def _run_pipeline_for_task(
+        self,
+        update: Update,
+        chat_id: int,
+        user_text: str,
+        task_kind: str,
+    ) -> None:
+        artifact_dir = self.generated_files_dir / str(chat_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        before_state = collect_file_state(artifact_dir)
+        reply_text = ""
+
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._typing_heartbeat(update, stop_typing))
+        try:
+            if task_kind == TASK_CODE:
+                reply_text = "[code]\n" + await self._run_coding_pipeline(update, chat_id, user_text)
+            elif task_kind == TASK_SURVEY:
+                reply_text = "[survey]\n" + await self._run_survey_pipeline(update, chat_id, user_text)
+            elif task_kind == TASK_DEFAULT:
+                reply_text = await self._run_codex_direct(chat_id, user_text)
+            else:
+                await self._reply_update_text(
+                    update,
+                    "Unsupported task kind.",
+                )
+                return
+        except Exception as exc:
+            self.logger.exception("pipeline execution failed")
+            await self._reply_update_text(update, f"Pipeline execution failed: {exc}")
+            return
+        finally:
+            stop_typing.set()
+            try:
+                await typing_task
+            except Exception:
+                self.logger.debug("typing heartbeat cleanup failed", exc_info=True)
 
         after_state = collect_file_state(artifact_dir)
 
@@ -554,6 +1237,9 @@ class TelegramCodexBot:
             before_state=before_state,
             after_state=after_state,
         )
+
+    def _resolve_task_kind(self, user_text: str) -> str:
+        return classify_task(user_text)
 
     def is_allowed(self, update: Update) -> bool:
         chat = update.effective_chat
@@ -583,11 +1269,88 @@ class TelegramCodexBot:
             return
         await self._reply_update_text(
             update,
-            "Send any text and I will reply using codex.\n"
-            "If you ask for a file, I will generate and send it as a Telegram document.\n"
-            "Use /reset to clear the mapped codex session.\n"
-            "Use /session to show current codex thread_id.\n"
-            "Use /whoami to print chat_id and user_id.",
+            "Send any text and I will route it automatically.\n"
+            "- default: codex direct response\n"
+            "- code task (code content detected): codex -> claude -> gemini, prefixed with [code]\n"
+            "- survey task (조사/리서치 request): gemini+codex -> claude, prefixed with [survey]\n"
+            "Use /model <agent> <name> to override model (agent: codex|claude|gemini).\n"
+            "Use /model <agent> clear to reset override.\n"
+            "Use /reset to clear codex coding session.",
+        )
+
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.ensure_allowed(update):
+            return
+        if not update.effective_chat or not update.message:
+            return
+
+        chat_id = update.effective_chat.id
+        args = context.args or []
+        if not args:
+            await self._reply_update_text(update, self._format_model_status(chat_id))
+            return
+
+        clear_tokens = {"clear", "reset", "default", "unset"}
+        first = args[0].strip().lower()
+        agent = self._normalize_agent_name(first)
+
+        # New syntax: /model <agent> <name> | /model <agent> clear
+        if agent is not None:
+            if len(args) == 1:
+                await self._reply_update_text(
+                    update,
+                    "Usage:\n"
+                    "/model <agent> <name>\n"
+                    "/model <agent> clear\n"
+                    f"agents={','.join(SUPPORTED_AGENTS)}\n\n"
+                    + self._format_model_status(chat_id),
+                )
+                return
+
+            requested_model = " ".join(args[1:]).strip()
+            if not requested_model:
+                await self._reply_update_text(update, self._format_model_status(chat_id))
+                return
+
+            if requested_model.lower() in clear_tokens:
+                cleared = self.sessions.clear_agent_model(chat_id, agent)
+                prefix = (
+                    f"{agent} model override cleared."
+                    if cleared
+                    else f"No {agent} model override to clear."
+                )
+                await self._reply_update_text(
+                    update,
+                    f"{prefix}\n{self._format_model_status(chat_id)}",
+                )
+                return
+
+            self.sessions.set_agent_model(chat_id, agent, requested_model)
+            await self._reply_update_text(
+                update,
+                f"{agent} model override updated.\n{self._format_model_status(chat_id)}",
+            )
+            return
+
+        # Legacy syntax: /model <name> (codex only)
+        requested_model = " ".join(args).strip()
+        if not requested_model:
+            await self._reply_update_text(update, self._format_model_status(chat_id))
+            return
+
+        if requested_model.lower() in clear_tokens:
+            cleared = self.sessions.clear_agent_model(chat_id, AGENT_CODEX)
+            prefix = "codex model override cleared." if cleared else "No codex model override to clear."
+            await self._reply_update_text(
+                update,
+                f"{prefix}\n{self._format_model_status(chat_id)}",
+            )
+            return
+
+        self.sessions.set_agent_model(chat_id, AGENT_CODEX, requested_model)
+        await self._reply_update_text(
+            update,
+            "codex model override updated (legacy syntax).\n" + self._format_model_status(chat_id),
         )
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -598,13 +1361,14 @@ class TelegramCodexBot:
             return
 
         deleted = self.sessions.delete(update.effective_chat.id)
+
         if deleted:
             await self._reply_update_text(
                 update,
-                "Session mapping cleared. Next message starts a new codex thread.",
+                "Session mapping cleared. Next coding task starts a new codex thread.",
             )
         else:
-            await self._reply_update_text(update, "No mapped session to clear.")
+            await self._reply_update_text(update, "No mapped codex session to clear.")
 
     async def cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -615,7 +1379,7 @@ class TelegramCodexBot:
 
         thread_id = self.sessions.get_thread_id(update.effective_chat.id)
         if thread_id:
-            await self._reply_update_text(update, f"thread_id={thread_id}")
+            await self._reply_update_text(update, f"codex_thread_id={thread_id}")
         else:
             await self._reply_update_text(update, "No mapped codex thread yet.")
 
@@ -625,9 +1389,34 @@ class TelegramCodexBot:
             return
         chat_id = update.effective_chat.id if update.effective_chat else None
         user_id = update.effective_user.id if update.effective_user else None
+
+        codex_model = ""
+        codex_source = ""
+        claude_model = ""
+        claude_source = ""
+        gemini_model = ""
+        gemini_source = ""
+        if chat_id is not None:
+            codex_model, codex_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
+            claude_model, claude_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
+            gemini_model, gemini_source = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+
         await self._reply_update_text(
             update,
-            f"chat_id={chat_id}\nuser_id={user_id}\ncodex_timeout_sec={self.codex_timeout_sec}",
+            (
+                f"chat_id={chat_id}\n"
+                f"user_id={user_id}\n"
+                f"codex_workdir={self.codex_workdir}\n"
+                f"codex_timeout_sec={self.codex_timeout_sec}\n"
+                f"claude_timeout_sec={self.claude_timeout_sec}\n"
+                f"gemini_timeout_sec={self.gemini_timeout_sec}\n"
+                f"codex_model={codex_model or '(codex default)'}\n"
+                f"codex_model_source={codex_source or '(none)'}\n"
+                f"claude_model={claude_model or '(none)'}\n"
+                f"claude_model_source={claude_source or '(none)'}\n"
+                f"gemini_model={gemini_model or '(none)'}\n"
+                f"gemini_model_source={gemini_source or '(none)'}"
+            ),
         )
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -642,7 +1431,14 @@ class TelegramCodexBot:
             return
 
         chat_id = update.effective_chat.id
-        await self._run_codex_for_chat(update=update, chat_id=chat_id, user_text=user_text)
+        task_kind = self._resolve_task_kind(user_text)
+
+        await self._run_pipeline_for_task(
+            update=update,
+            chat_id=chat_id,
+            user_text=user_text,
+            task_kind=task_kind,
+        )
 
     async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -680,28 +1476,19 @@ class TelegramCodexBot:
             f"name={original_name or saved_name}",
             f"mime_type={document.mime_type or 'unknown'}",
             f"size_bytes={document.file_size if document.file_size is not None else 'unknown'}",
+            "",
+            "[User instruction]",
+            caption if caption else "Analyze this file and summarize key points.",
         ]
-        if caption:
-            prompt_lines.extend(
-                [
-                    "",
-                    "[User instruction]",
-                    caption,
-                ]
-            )
-        else:
-            prompt_lines.extend(
-                [
-                    "",
-                    "[User instruction]",
-                    "Analyze this file and summarize key points.",
-                ]
-            )
 
-        await self._run_codex_for_chat(
+        user_text = "\n".join(prompt_lines)
+        task_kind = self._resolve_task_kind(user_text)
+
+        await self._run_pipeline_for_task(
             update=update,
             chat_id=chat_id,
-            user_text="\n".join(prompt_lines),
+            user_text=user_text,
+            task_kind=task_kind,
         )
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -725,6 +1512,7 @@ class TelegramCodexBot:
         )
         app = builder.build()
         app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("whoami", self.cmd_whoami))
@@ -735,7 +1523,7 @@ class TelegramCodexBot:
 
     def run(self) -> None:
         app = self.build_application()
-        self.logger.info("Bot started with codex backend")
+        self.logger.info("Bot started with multi-agent backend (codex+claude+gemini)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

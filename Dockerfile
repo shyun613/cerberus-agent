@@ -6,8 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs npm && \
-    npm install -g @openai/codex && \
+    apt-get install -y --no-install-recommends nodejs npm ripgrep && \
+    npm install -g @openai/codex @anthropic-ai/claude-code @google/gemini-cli && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

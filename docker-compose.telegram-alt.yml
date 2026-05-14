@@ -1,0 +1,19 @@
+services:
+  telegram-openai-bot-alt:
+    image: telegram-openai-bot:codex
+    container_name: telegram-openai-bot-alt
+    env_file:
+      - .env.telegram-alt
+    working_dir: /app
+    command: ["/app/docker-entrypoint.sh"]
+    volumes:
+      - ./:/app
+      - ${HOME}/.codex:/root/.codex
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.gemini:/root/.gemini
+      - type: bind
+        source: ${HOME}/.claude.json
+        target: /root/.claude.json
+        bind:
+          create_host_path: false
+    restart: unless-stopped
