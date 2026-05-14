@@ -12,6 +12,13 @@ Task routing policy:
 - `code`: if code content is detected, run `codex` implement -> `claude` review/fix -> `gemini` assist, and prefix response with `[code]`
 - `survey`: if user asks to research/investigate (`조사`, `research`, `survey`, etc.), run `gemini` + `codex` collect/summarize -> `claude` validate/judge, and prefix response with `[survey]`
 
+## Commit status (verified)
+
+- `11a0711` (HEAD): `model ensemble`
+- `beee918`: `first commit telegram-codex-agent repo`
+
+This README reflects behavior in `11a0711`.
+
 ## Persistence
 
 For stable restarts, keep these mounted:
@@ -22,13 +29,19 @@ For stable restarts, keep these mounted:
 - `/root/.gemini` (Gemini auth/session)
 - `/app/data` (chat session DB, uploads, generated files)
 
+If `/root/.claude.json` is missing but `/root/.claude/backups` exists, `docker-entrypoint.sh` restores the latest backup automatically.
+
 `/session` and `/reset` are for the Codex coding thread mapping only.
 
 ## 1) Prepare env
 
 ```bash
+cp .env.example .env.telegram-alt
+# optional (for plain docker run examples below)
 cp .env.example .env
 ```
+
+`docker-compose.telegram-alt.yml` and helper scripts use `.env.telegram-alt` by default.
 
 Required:
 
@@ -37,11 +50,14 @@ Required:
 Main optional vars:
 
 - `CODEX_BIN`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`, `CODEX_WORKDIR`, `CODEX_TIMEOUT_SEC`
+- `CODEX_SYSTEM_PROMPT`
 - `CLAUDE_BIN`, `CLAUDE_MODEL` (default: `claude-sonnet-4-6`), `CLAUDE_EXTRA_ARGS`, `CLAUDE_TIMEOUT_SEC`, `CLAUDE_PERMISSION_MODE` (default: `acceptEdits`)
 - `GEMINI_BIN`, `GEMINI_MODEL` (default: `gemini-3-pro-preview`), `GEMINI_EXTRA_ARGS`, `GEMINI_TIMEOUT_SEC`, `GEMINI_APPROVAL_MODE`, `GEMINI_CLI_TRUST_WORKSPACE` (default: `true`)
 - `UPLOAD_DIR`, `GENERATED_FILES_DIR`, `MAX_RETURN_FILES`, `MAX_RETURN_FILE_SIZE_MB`
 - `SESSION_DB_PATH`
 - `ALLOWED_CHAT_IDS`, `ALLOWED_USER_IDS`
+- `TELEGRAM_API_TIMEOUT_SEC`, `TELEGRAM_SEND_RETRIES`, `TELEGRAM_SEND_RETRY_DELAY_SEC`
+- `LOG_LEVEL`
 
 Model resolution priority (per agent):
 
@@ -75,6 +91,12 @@ Legacy compose:
 docker-compose -f docker-compose.telegram-alt.yml up -d --build
 ```
 
+Helper runner (default args: `.env.telegram-alt`, `telegram-openai-bot-alt`, `telegram-openai-bot:codex`):
+
+```bash
+./run-telegram-alt-container.sh [ENV_FILE] [CONTAINER_NAME] [IMAGE]
+```
+
 ## 4) Start without Compose
 
 ```bash
@@ -96,6 +118,12 @@ docker run -d \
 docker compose -f docker-compose.telegram-alt.yml logs -f telegram-openai-bot-alt
 ```
 
+Helper script:
+
+```bash
+./logs-telegram-alt-container.sh [CONTAINER_NAME]
+```
+
 Without Compose:
 
 ```bash
@@ -112,6 +140,12 @@ docker logs -f telegram-openai-bot
 
 ```bash
 docker compose -f docker-compose.telegram-alt.yml down
+```
+
+Helper script:
+
+```bash
+./stop-telegram-alt-container.sh [CONTAINER_NAME]
 ```
 
 Without Compose:
