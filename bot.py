@@ -6,6 +6,7 @@ import re
 import shlex
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional, Set
 
@@ -236,6 +237,17 @@ class SessionStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS chat_agent_sessions (
+                    chat_id INTEGER NOT NULL,
+                    agent TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, agent)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS chat_models (
                     chat_id INTEGER PRIMARY KEY,
                     model TEXT NOT NULL,
@@ -254,6 +266,16 @@ class SessionStore:
                 )
                 """
             )
+            # Backfill legacy codex thread mappings if present.
+            conn.execute(
+                """
+                INSERT INTO chat_agent_sessions (chat_id, agent, session_id, updated_at)
+                SELECT chat_id, 'codex', thread_id, updated_at
+                FROM sessions
+                WHERE thread_id IS NOT NULL AND TRIM(thread_id) != ''
+                ON CONFLICT(chat_id, agent) DO NOTHING
+                """
+            )
             # Backfill legacy codex overrides if present.
             conn.execute(
                 """
@@ -266,7 +288,91 @@ class SessionStore:
             )
             conn.commit()
 
+    def get_agent_session_id(self, chat_id: int, agent: str) -> Optional[str]:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM chat_agent_sessions WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            ).fetchone()
+        if row is None:
+            return None
+        session_id = str(row[0]).strip()
+        return session_id if session_id else None
+
+    def set_agent_session_id(self, chat_id: int, agent: str, session_id: str) -> None:
+        normalized_agent = self._validate_agent(agent)
+        normalized_session_id = session_id.strip()
+        if not normalized_session_id:
+            raise ValueError("session_id must not be empty")
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_agent_sessions (chat_id, agent, session_id, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, agent) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, normalized_agent, normalized_session_id),
+            )
+            conn.commit()
+
+    def clear_agent_session_id(self, chat_id: int, agent: str) -> bool:
+        normalized_agent = self._validate_agent(agent)
+        deleted_rows = 0
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM chat_agent_sessions WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            )
+            deleted_rows += cursor.rowcount
+            if normalized_agent == AGENT_CODEX:
+                legacy_cursor = conn.execute(
+                    "DELETE FROM sessions WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                deleted_rows += legacy_cursor.rowcount
+            conn.commit()
+        return deleted_rows > 0
+
+    def list_agent_sessions(self, chat_id: int) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT agent, session_id FROM chat_agent_sessions WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchall()
+        result: dict[str, str] = {}
+        for row in rows:
+            agent = str(row[0]).strip().lower()
+            session_id = str(row[1]).strip()
+            if agent in SUPPORTED_AGENTS and session_id:
+                result[agent] = session_id
+        return result
+
+    def clear_all_sessions(self, chat_id: int) -> bool:
+        deleted_rows = 0
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM chat_agent_sessions WHERE chat_id = ?",
+                (chat_id,),
+            )
+            deleted_rows += cursor.rowcount
+            legacy_cursor = conn.execute(
+                "DELETE FROM sessions WHERE chat_id = ?",
+                (chat_id,),
+            )
+            deleted_rows += legacy_cursor.rowcount
+            conn.commit()
+        return deleted_rows > 0
+
     def get_thread_id(self, chat_id: int) -> Optional[str]:
+        mapped = self.get_agent_session_id(chat_id, AGENT_CODEX)
+        if mapped:
+            return mapped
+
+        # Legacy fallback for pre-agent-session rows.
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT thread_id FROM sessions WHERE chat_id = ?",
@@ -274,9 +380,18 @@ class SessionStore:
             ).fetchone()
         if row is None:
             return None
-        return str(row[0])
+        thread_id = str(row[0]).strip()
+        if not thread_id:
+            return None
+        self.set_agent_session_id(chat_id, AGENT_CODEX, thread_id)
+        return thread_id
 
     def set_thread_id(self, chat_id: int, thread_id: str) -> None:
+        normalized_thread_id = thread_id.strip()
+        if not normalized_thread_id:
+            raise ValueError("thread_id must not be empty")
+
+        self.set_agent_session_id(chat_id, AGENT_CODEX, normalized_thread_id)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -286,18 +401,12 @@ class SessionStore:
                     thread_id = excluded.thread_id,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (chat_id, thread_id),
+                (chat_id, normalized_thread_id),
             )
             conn.commit()
 
     def delete(self, chat_id: int) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE chat_id = ?",
-                (chat_id,),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        return self.clear_all_sessions(chat_id)
 
     @staticmethod
     def _validate_agent(agent: str) -> str:
@@ -495,8 +604,21 @@ class CliTextRunner:
         self.timeout_sec = timeout_sec
         self.base_args = list(base_args)
 
-    def _build_command(self, prompt: str, model: Optional[str] = None) -> list[str]:
+    def _build_command(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> list[str]:
         cmd = [self.cli_bin, *self.base_args]
+        resolved_resume_session_id = (resume_session_id or "").strip()
+        resolved_session_id = (session_id or "").strip()
+        if resolved_resume_session_id:
+            cmd.extend(["--resume", resolved_resume_session_id])
+        elif resolved_session_id:
+            cmd.extend(["--session-id", resolved_session_id])
+
         resolved_model = (model or "").strip() or self.default_model
         if resolved_model:
             if self.label == "gemini":
@@ -510,8 +632,19 @@ class CliTextRunner:
             cmd.append(prompt)
         return cmd
 
-    async def run_prompt(self, prompt: str, model: Optional[str] = None) -> str:
-        cmd = self._build_command(prompt=prompt, model=model)
+    async def run_prompt(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        cmd = self._build_command(
+            prompt=prompt,
+            model=model,
+            resume_session_id=resume_session_id,
+            session_id=session_id,
+        )
         env = dict(os.environ)
         env.setdefault("NO_COLOR", "1")
         if self.label == "gemini":
@@ -1054,6 +1187,56 @@ class TelegramCodexBot:
         lines.append("usage: /model <agent> <name> | /model <agent> clear")
         return "\n".join(lines)
 
+    @staticmethod
+    def _looks_like_missing_session_error(error_text: str) -> bool:
+        normalized = error_text.lower()
+        tokens = (
+            "no conversation found",
+            "session not found",
+            "unknown session",
+            "invalid session",
+            "not a resumable session",
+            "failed to resume",
+            "cannot resume",
+        )
+        return any(token in normalized for token in tokens)
+
+    async def _run_stateful_text_agent(
+        self,
+        chat_id: int,
+        agent: str,
+        runner: CliTextRunner,
+        prompt: str,
+        model: str,
+    ) -> str:
+        existing_session_id = self.sessions.get_agent_session_id(chat_id, agent)
+        if existing_session_id:
+            try:
+                return await runner.run_prompt(
+                    prompt=prompt,
+                    model=model,
+                    resume_session_id=existing_session_id,
+                )
+            except RuntimeError as exc:
+                if not self._looks_like_missing_session_error(str(exc)):
+                    raise
+                self.logger.warning(
+                    "%s resume failed for chat_id=%s session_id=%s; rotating session: %s",
+                    agent,
+                    chat_id,
+                    existing_session_id,
+                    exc,
+                )
+
+        new_session_id = str(uuid.uuid4())
+        reply = await runner.run_prompt(
+            prompt=prompt,
+            model=model,
+            session_id=new_session_id,
+        )
+        self.sessions.set_agent_session_id(chat_id, agent, new_session_id)
+        return reply
+
     async def _run_coding_pipeline(self, update: Update, chat_id: int, user_text: str) -> str:
         artifact_dir = self.generated_files_dir / str(chat_id)
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1082,14 +1265,26 @@ class TelegramCodexBot:
             codex_result=codex_result,
             artifact_dir=artifact_dir,
         )
-        claude_result = await self.claude_runner.run_prompt(claude_prompt, model=claude_model)
+        claude_result = await self._run_stateful_text_agent(
+            chat_id=chat_id,
+            agent=AGENT_CLAUDE,
+            runner=self.claude_runner,
+            prompt=claude_prompt,
+            model=claude_model,
+        )
 
         gemini_prompt = self._build_gemini_coding_assist_prompt(
             user_text=user_text,
             codex_result=codex_result,
             claude_result=claude_result,
         )
-        gemini_result = await self.gemini_runner.run_prompt(gemini_prompt, model=gemini_model)
+        gemini_result = await self._run_stateful_text_agent(
+            chat_id=chat_id,
+            agent=AGENT_GEMINI,
+            runner=self.gemini_runner,
+            prompt=gemini_prompt,
+            model=gemini_model,
+        )
 
         return (
             "[Routing]\n"
@@ -1139,7 +1334,13 @@ class TelegramCodexBot:
             thread_id=None,
             model=codex_model,
         )
-        gemini_task = self.gemini_runner.run_prompt(gemini_prompt, model=gemini_model)
+        gemini_task = self._run_stateful_text_agent(
+            chat_id=chat_id,
+            agent=AGENT_GEMINI,
+            runner=self.gemini_runner,
+            prompt=gemini_prompt,
+            model=gemini_model,
+        )
 
         codex_result = ""
         gemini_result = ""
@@ -1176,7 +1377,13 @@ class TelegramCodexBot:
             codex_result=codex_result,
             gemini_result=gemini_result,
         )
-        claude_result = await self.claude_runner.run_prompt(claude_prompt, model=claude_model)
+        claude_result = await self._run_stateful_text_agent(
+            chat_id=chat_id,
+            agent=AGENT_CLAUDE,
+            runner=self.claude_runner,
+            prompt=claude_prompt,
+            model=claude_model,
+        )
 
         return (
             "[Routing]\n"
@@ -1275,7 +1482,8 @@ class TelegramCodexBot:
             "- survey task (조사/리서치 request): gemini+codex -> claude, prefixed with [survey]\n"
             "Use /model <agent> <name> to override model (agent: codex|claude|gemini).\n"
             "Use /model <agent> clear to reset override.\n"
-            "Use /reset to clear codex coding session.",
+            "Use /session to view mapped sessions.\n"
+            "Use /reset [agent|all] to clear mapped sessions.",
         )
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1354,21 +1562,43 @@ class TelegramCodexBot:
         )
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        del context
         if not await self.ensure_allowed(update):
             return
         if not update.effective_chat or not update.message:
             return
 
-        deleted = self.sessions.delete(update.effective_chat.id)
+        chat_id = update.effective_chat.id
+        args = context.args or []
+        target = (args[0].strip().lower() if args else "all")
 
+        if target in {"all", "*"}:
+            deleted = self.sessions.clear_all_sessions(chat_id)
+            if deleted:
+                await self._reply_update_text(
+                    update,
+                    "All mapped sessions cleared. Next request per agent starts a new session.",
+                )
+            else:
+                await self._reply_update_text(update, "No mapped sessions to clear.")
+            return
+
+        agent = self._normalize_agent_name(target)
+        if agent is None:
+            await self._reply_update_text(
+                update,
+                "Usage:\n/reset\n/reset all\n/reset <agent>\n"
+                f"agents={','.join(SUPPORTED_AGENTS)}",
+            )
+            return
+
+        deleted = self.sessions.clear_agent_session_id(chat_id, agent)
         if deleted:
             await self._reply_update_text(
                 update,
-                "Session mapping cleared. Next coding task starts a new codex thread.",
+                f"{agent} session cleared. Next {agent} request starts a new session.",
             )
         else:
-            await self._reply_update_text(update, "No mapped codex session to clear.")
+            await self._reply_update_text(update, f"No mapped {agent} session to clear.")
 
     async def cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -1377,11 +1607,12 @@ class TelegramCodexBot:
         if not update.effective_chat or not update.message:
             return
 
-        thread_id = self.sessions.get_thread_id(update.effective_chat.id)
-        if thread_id:
-            await self._reply_update_text(update, f"codex_thread_id={thread_id}")
-        else:
-            await self._reply_update_text(update, "No mapped codex thread yet.")
+        chat_id = update.effective_chat.id
+        mapped = self.sessions.list_agent_sessions(chat_id)
+        lines: list[str] = []
+        for agent in SUPPORTED_AGENTS:
+            lines.append(f"{agent}_session_id={mapped.get(agent, '(none)')}")
+        await self._reply_update_text(update, "\n".join(lines))
 
     async def cmd_whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -1396,10 +1627,12 @@ class TelegramCodexBot:
         claude_source = ""
         gemini_model = ""
         gemini_source = ""
+        mapped_sessions: dict[str, str] = {}
         if chat_id is not None:
             codex_model, codex_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
             claude_model, claude_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
             gemini_model, gemini_source = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+            mapped_sessions = self.sessions.list_agent_sessions(chat_id)
 
         await self._reply_update_text(
             update,
@@ -1415,7 +1648,10 @@ class TelegramCodexBot:
                 f"claude_model={claude_model or '(none)'}\n"
                 f"claude_model_source={claude_source or '(none)'}\n"
                 f"gemini_model={gemini_model or '(none)'}\n"
-                f"gemini_model_source={gemini_source or '(none)'}"
+                f"gemini_model_source={gemini_source or '(none)'}\n"
+                f"codex_session_id={mapped_sessions.get(AGENT_CODEX, '(none)')}\n"
+                f"claude_session_id={mapped_sessions.get(AGENT_CLAUDE, '(none)')}\n"
+                f"gemini_session_id={mapped_sessions.get(AGENT_GEMINI, '(none)')}"
             ),
         )
 

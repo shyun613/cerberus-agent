@@ -31,7 +31,7 @@ For stable restarts, keep these mounted:
 
 If `/root/.claude.json` is missing but `/root/.claude/backups` exists, `docker-entrypoint.sh` restores the latest backup automatically.
 
-`/session` and `/reset` are for the Codex coding thread mapping only.
+`/session` and `/reset` manage per-agent mapped sessions (`codex`, `claude`, `gemini`).
 
 ## 1) Prepare env
 
@@ -162,8 +162,10 @@ docker stop telegram-openai-bot && docker rm telegram-openai-bot
 - `/model clear` (legacy: clear codex override)
 - `/model <agent> <name>` (`agent`: `codex|claude|gemini`)
 - `/model <agent> clear`
-- `/session`
-- `/reset`
+- `/session` (show mapped session IDs for codex/claude/gemini)
+- `/reset` (clear all mapped sessions)
+- `/reset <agent>` (clear mapped session for `codex|claude|gemini`)
+- `/reset all` (same as `/reset`)
 - `/whoami`
 
 Document uploads are supported. The bot downloads the file to `UPLOAD_DIR` and runs the same routing policy.
