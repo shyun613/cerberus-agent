@@ -4,13 +4,13 @@ This bot orchestrates three local CLIs:
 
 - `codex`
 - `claude`
-- `gemini`
+- `antigravity` (legacy alias: `gemini`)
 
 Task routing policy:
 
 - `default`: direct `codex` response
-- `code`: if code content is detected, run `codex` implement -> `claude` review/fix -> `gemini` assist, and prefix response with `[code]`
-- `survey`: if user asks to research/investigate (`조사`, `research`, `survey`, etc.), run `gemini` + `codex` collect/summarize -> `claude` validate/judge, and prefix response with `[survey]`
+- `code`: if code content is detected, run `codex` implement -> `claude` review/fix -> `antigravity` assist, and prefix response with `[code]`
+- `survey`: if user asks to research/investigate (`조사`, `research`, `survey`, etc.), run `antigravity` + `codex` collect/summarize -> `claude` validate/judge, and prefix response with `[survey]`
 
 ## Commit status (verified)
 
@@ -26,12 +26,13 @@ For stable restarts, keep these mounted:
 - `/root/.codex` (Codex auth/session)
 - `/root/.claude` (Claude auth/session)
 - `/root/.claude.json` (Claude CLI config file)
-- `/root/.gemini` (Gemini auth/session)
+- `/root/.antigravity` (Antigravity auth/session)
+- `/root/.gemini` (legacy Gemini auth/session; fallback compatibility)
 - `/app/data` (chat session DB, uploads, generated files)
 
 If `/root/.claude.json` is missing but `/root/.claude/backups` exists, `docker-entrypoint.sh` restores the latest backup automatically.
 
-`/session` and `/reset` manage per-agent mapped sessions (`codex`, `claude`, `gemini`).
+`/session` and `/reset` manage per-agent mapped sessions (`codex`, `claude`, `antigravity`).
 
 ## 1) Prepare env
 
@@ -52,9 +53,11 @@ Main optional vars:
 - `CODEX_BIN`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`, `CODEX_WORKDIR`, `CODEX_TIMEOUT_SEC`
 - `CODEX_SYSTEM_PROMPT`
 - `CLAUDE_BIN`, `CLAUDE_MODEL` (default: `claude-sonnet-4-6`), `CLAUDE_EXTRA_ARGS`, `CLAUDE_TIMEOUT_SEC`, `CLAUDE_PERMISSION_MODE` (default: `acceptEdits`)
-- `GEMINI_BIN`, `GEMINI_MODEL` (default: `gemini-3-pro-preview`), `GEMINI_EXTRA_ARGS`, `GEMINI_TIMEOUT_SEC`, `GEMINI_APPROVAL_MODE`, `GEMINI_CLI_TRUST_WORKSPACE` (default: `true`)
+- `ANTIGRAVITY_BIN`, `ANTIGRAVITY_MODEL` (default: `gemini-3-pro-preview`), `ANTIGRAVITY_EXTRA_ARGS`, `ANTIGRAVITY_TIMEOUT_SEC`, `ANTIGRAVITY_APPROVAL_MODE`, `ANTIGRAVITY_CLI_TRUST_WORKSPACE` (default: `true`)
+- legacy env compatibility: `GEMINI_*` is still accepted as fallback
 - `UPLOAD_DIR`, `GENERATED_FILES_DIR`, `MAX_RETURN_FILES`, `MAX_RETURN_FILE_SIZE_MB`
 - `SESSION_DB_PATH`
+- `SESSION_COMPACT_EVERY_TURNS` (default: `5`, auto compact per agent session)
 - `ALLOWED_CHAT_IDS`, `ALLOWED_USER_IDS`
 - `TELEGRAM_API_TIMEOUT_SEC`, `TELEGRAM_SEND_RETRIES`, `TELEGRAM_SEND_RETRY_DELAY_SEC`
 - `LOG_LEVEL`
@@ -62,7 +65,7 @@ Main optional vars:
 Model resolution priority (per agent):
 
 - chat override via `/model <agent> <name>`
-- `*_MODEL` from env (`CODEX_MODEL`, `CLAUDE_MODEL`, `GEMINI_MODEL`)
+- `*_MODEL` from env (`CODEX_MODEL`, `CLAUDE_MODEL`, `ANTIGRAVITY_MODEL`)
 - each CLI's own default (if env/default is blank)
 
 ## 2) Verify host logins
@@ -70,13 +73,13 @@ Model resolution priority (per agent):
 ```bash
 codex login status
 claude auth status
-gemini
+antigravity
 ```
 
-For `gemini`, a quick headless check also works:
+For `antigravity`, a quick headless check also works:
 
 ```bash
-gemini -p "Reply with exactly: OK" --output-format text
+antigravity --prompt "Reply with exactly: OK" --output-format text
 ```
 
 ## 3) Start with Docker Compose
@@ -107,6 +110,7 @@ docker run -d \
   -v "$(pwd):/app" \
   -v "$HOME/.codex:/root/.codex" \
   -v "$HOME/.claude:/root/.claude" \
+  -v "$HOME/.antigravity:/root/.antigravity" \
   -v "$HOME/.gemini:/root/.gemini" \
   --restart unless-stopped \
   telegram-openai-bot:local
@@ -157,16 +161,21 @@ docker stop telegram-openai-bot && docker rm telegram-openai-bot
 ## Telegram commands
 
 - `/start`
-- `/model` (show codex/claude/gemini effective models and sources)
+- `/model` (show codex/claude/antigravity effective models and sources)
 - `/model <name>` (legacy: set codex model)
 - `/model clear` (legacy: clear codex override)
-- `/model <agent> <name>` (`agent`: `codex|claude|gemini`)
+- `/model <agent> <name>` (`agent`: `codex|claude|antigravity` - `gemini` alias accepted)
 - `/model <agent> clear`
-- `/session` (show mapped session IDs for codex/claude/gemini)
+- `/session` (show mapped session IDs + per-agent turn counters)
 - `/reset` (clear all mapped sessions)
-- `/reset <agent>` (clear mapped session for `codex|claude|gemini`)
+- `/reset <agent>` (clear mapped session for `codex|claude|antigravity`; `gemini` alias accepted)
 - `/reset all` (same as `/reset`)
 - `/whoami`
+
+Session compaction:
+
+- Every `SESSION_COMPACT_EVERY_TURNS` turns (default `5`), each agent session auto-compacts.
+- Commands: `codex=/compact`, `claude=/compact`, `antigravity=/compress`.
 
 Document uploads are supported. The bot downloads the file to `UPLOAD_DIR` and runs the same routing policy.
 

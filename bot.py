@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -22,8 +23,12 @@ TASK_CODE = "code"
 TASK_SURVEY = "survey"
 AGENT_CODEX = "codex"
 AGENT_CLAUDE = "claude"
-AGENT_GEMINI = "gemini"
-SUPPORTED_AGENTS = (AGENT_CODEX, AGENT_CLAUDE, AGENT_GEMINI)
+AGENT_ANTIGRAVITY = "antigravity"
+LEGACY_AGENT_GEMINI = "gemini"
+SUPPORTED_AGENTS = (AGENT_CODEX, AGENT_CLAUDE, AGENT_ANTIGRAVITY)
+AGENT_NAME_ALIASES = {
+    LEGACY_AGENT_GEMINI: AGENT_ANTIGRAVITY,
+}
 
 
 def parse_id_set(raw: str) -> Set[int]:
@@ -200,6 +205,31 @@ def classify_task(user_text: str) -> str:
     return TASK_DEFAULT
 
 
+def normalize_agent_name(token: str) -> str:
+    normalized = token.strip().lower()
+    return AGENT_NAME_ALIASES.get(normalized, normalized)
+
+
+def read_env_with_legacy(primary_key: str, legacy_key: str, default: str = "") -> str:
+    primary = os.getenv(primary_key, "").strip()
+    if primary:
+        return primary
+    legacy = os.getenv(legacy_key, "").strip()
+    if legacy:
+        return legacy
+    return default
+
+
+def read_int_env_with_legacy(primary_key: str, legacy_key: str, default: int) -> int:
+    primary = os.getenv(primary_key, "").strip()
+    if primary:
+        return int(primary)
+    legacy = os.getenv(legacy_key, "").strip()
+    if legacy:
+        return int(legacy)
+    return default
+
+
 def strip_cli_noise(text: str) -> str:
     noise_prefixes = (
         "Warning: True color",
@@ -266,6 +296,17 @@ class SessionStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_agent_turns (
+                    chat_id INTEGER NOT NULL,
+                    agent TEXT NOT NULL,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, agent)
+                )
+                """
+            )
             # Backfill legacy codex thread mappings if present.
             conn.execute(
                 """
@@ -285,6 +326,53 @@ class SessionStore:
                 WHERE 1
                 ON CONFLICT(chat_id, agent) DO NOTHING
                 """
+            )
+            # Migrate legacy gemini agent rows to antigravity.
+            conn.execute(
+                """
+                INSERT INTO chat_agent_sessions (chat_id, agent, session_id, updated_at)
+                SELECT chat_id, ?, session_id, updated_at
+                FROM chat_agent_sessions
+                WHERE agent = ?
+                ON CONFLICT(chat_id, agent) DO NOTHING
+                """,
+                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
+            )
+            conn.execute(
+                "DELETE FROM chat_agent_sessions WHERE agent = ?",
+                (LEGACY_AGENT_GEMINI,),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO chat_agent_models (chat_id, agent, model, updated_at)
+                SELECT chat_id, ?, model, updated_at
+                FROM chat_agent_models
+                WHERE agent = ?
+                ON CONFLICT(chat_id, agent) DO NOTHING
+                """,
+                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
+            )
+            conn.execute(
+                "DELETE FROM chat_agent_models WHERE agent = ?",
+                (LEGACY_AGENT_GEMINI,),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO chat_agent_turns (chat_id, agent, turn_count, updated_at)
+                SELECT chat_id, ?, turn_count, updated_at
+                FROM chat_agent_turns
+                WHERE agent = ?
+                ON CONFLICT(chat_id, agent) DO UPDATE SET
+                    turn_count = MAX(chat_agent_turns.turn_count, excluded.turn_count),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
+            )
+            conn.execute(
+                "DELETE FROM chat_agent_turns WHERE agent = ?",
+                (LEGACY_AGENT_GEMINI,),
             )
             conn.commit()
 
@@ -334,6 +422,11 @@ class SessionStore:
                     (chat_id,),
                 )
                 deleted_rows += legacy_cursor.rowcount
+            turn_cursor = conn.execute(
+                "DELETE FROM chat_agent_turns WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            )
+            deleted_rows += turn_cursor.rowcount
             conn.commit()
         return deleted_rows > 0
 
@@ -345,7 +438,7 @@ class SessionStore:
             ).fetchall()
         result: dict[str, str] = {}
         for row in rows:
-            agent = str(row[0]).strip().lower()
+            agent = normalize_agent_name(str(row[0]))
             session_id = str(row[1]).strip()
             if agent in SUPPORTED_AGENTS and session_id:
                 result[agent] = session_id
@@ -364,8 +457,68 @@ class SessionStore:
                 (chat_id,),
             )
             deleted_rows += legacy_cursor.rowcount
+            turn_cursor = conn.execute(
+                "DELETE FROM chat_agent_turns WHERE chat_id = ?",
+                (chat_id,),
+            )
+            deleted_rows += turn_cursor.rowcount
             conn.commit()
         return deleted_rows > 0
+
+    def get_agent_turn_count(self, chat_id: int, agent: str) -> int:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT turn_count FROM chat_agent_turns WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return max(int(row[0]), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def increment_agent_turn_count(self, chat_id: int, agent: str) -> int:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_agent_turns (chat_id, agent, turn_count, updated_at)
+                VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, agent) DO UPDATE SET
+                    turn_count = turn_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, normalized_agent),
+            )
+            row = conn.execute(
+                "SELECT turn_count FROM chat_agent_turns WHERE chat_id = ? AND agent = ?",
+                (chat_id, normalized_agent),
+            ).fetchone()
+            conn.commit()
+
+        if row is None:
+            return 0
+        try:
+            return max(int(row[0]), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def reset_agent_turn_count(self, chat_id: int, agent: str) -> None:
+        normalized_agent = self._validate_agent(agent)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_agent_turns (chat_id, agent, turn_count, updated_at)
+                VALUES (?, ?, 0, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, agent) DO UPDATE SET
+                    turn_count = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, normalized_agent),
+            )
+            conn.commit()
 
     def get_thread_id(self, chat_id: int) -> Optional[str]:
         mapped = self.get_agent_session_id(chat_id, AGENT_CODEX)
@@ -410,7 +563,7 @@ class SessionStore:
 
     @staticmethod
     def _validate_agent(agent: str) -> str:
-        normalized = agent.strip().lower()
+        normalized = normalize_agent_name(agent)
         if normalized not in SUPPORTED_AGENTS:
             raise ValueError(f"unsupported agent: {agent}")
         return normalized
@@ -621,13 +774,10 @@ class CliTextRunner:
 
         resolved_model = (model or "").strip() or self.default_model
         if resolved_model:
-            if self.label == "gemini":
-                cmd.extend(["-m", resolved_model])
-            else:
-                cmd.extend(["--model", resolved_model])
+            cmd.extend(["--model", resolved_model])
         cmd.extend(self.extra_args)
-        if self.label == "gemini":
-            cmd.extend(["-p", prompt])
+        if self.label == AGENT_ANTIGRAVITY:
+            cmd.extend(["--prompt", prompt])
         else:
             cmd.append(prompt)
         return cmd
@@ -647,8 +797,14 @@ class CliTextRunner:
         )
         env = dict(os.environ)
         env.setdefault("NO_COLOR", "1")
-        if self.label == "gemini":
-            env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
+        if self.label == AGENT_ANTIGRAVITY:
+            trust_workspace = read_env_with_legacy(
+                "ANTIGRAVITY_CLI_TRUST_WORKSPACE",
+                "GEMINI_CLI_TRUST_WORKSPACE",
+                "true",
+            )
+            env.setdefault("ANTIGRAVITY_CLI_TRUST_WORKSPACE", trust_workspace)
+            env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", trust_workspace)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -746,15 +902,54 @@ class TelegramCodexBot:
             )
             claude_permission_mode = "acceptEdits"
 
-        gemini_bin = os.getenv("GEMINI_BIN", "gemini").strip() or "gemini"
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview").strip()
-        gemini_extra_args = shlex.split(os.getenv("GEMINI_EXTRA_ARGS", ""))
-        gemini_timeout = int(os.getenv("GEMINI_TIMEOUT_SEC", str(codex_timeout)))
-        gemini_approval_mode = os.getenv("GEMINI_APPROVAL_MODE", "yolo").strip()
+        antigravity_bin = read_env_with_legacy(
+            "ANTIGRAVITY_BIN",
+            "GEMINI_BIN",
+            AGENT_ANTIGRAVITY,
+        )
+        legacy_gemini_bin = os.getenv("GEMINI_BIN", LEGACY_AGENT_GEMINI).strip() or LEGACY_AGENT_GEMINI
+        if (
+            not shutil.which(antigravity_bin)
+            and antigravity_bin != legacy_gemini_bin
+            and shutil.which(legacy_gemini_bin)
+        ):
+            self.logger.warning(
+                "ANTIGRAVITY_BIN=%s is not found; falling back to GEMINI_BIN=%s",
+                antigravity_bin,
+                legacy_gemini_bin,
+            )
+            antigravity_bin = legacy_gemini_bin
+        antigravity_model = read_env_with_legacy(
+            "ANTIGRAVITY_MODEL",
+            "GEMINI_MODEL",
+            "gemini-3-pro-preview",
+        )
+        antigravity_extra_args = shlex.split(
+            read_env_with_legacy(
+                "ANTIGRAVITY_EXTRA_ARGS",
+                "GEMINI_EXTRA_ARGS",
+                "",
+            )
+        )
+        antigravity_timeout = read_int_env_with_legacy(
+            "ANTIGRAVITY_TIMEOUT_SEC",
+            "GEMINI_TIMEOUT_SEC",
+            codex_timeout,
+        )
+        antigravity_approval_mode = read_env_with_legacy(
+            "ANTIGRAVITY_APPROVAL_MODE",
+            "GEMINI_APPROVAL_MODE",
+            "yolo",
+        )
 
         telegram_api_timeout = float(os.getenv("TELEGRAM_API_TIMEOUT_SEC", "30"))
         telegram_send_retries = int(os.getenv("TELEGRAM_SEND_RETRIES", "3"))
         telegram_send_retry_delay = float(os.getenv("TELEGRAM_SEND_RETRY_DELAY_SEC", "1.0"))
+        self.session_compact_every_turns = parse_positive_int(
+            os.getenv("SESSION_COMPACT_EVERY_TURNS", "5"),
+            default=5,
+            min_value=1,
+        )
 
         self.codex_runner = CodexRunner(
             codex_bin=codex_bin,
@@ -778,28 +973,28 @@ class TelegramCodexBot:
             base_args=claude_base_args,
         )
 
-        gemini_base_args = ["--output-format", "text"]
-        if gemini_approval_mode:
-            gemini_base_args.extend(["--approval-mode", gemini_approval_mode])
+        antigravity_base_args = ["--output-format", "text"]
+        if antigravity_approval_mode:
+            antigravity_base_args.extend(["--approval-mode", antigravity_approval_mode])
 
-        self.gemini_runner = CliTextRunner(
-            label="gemini",
-            cli_bin=gemini_bin,
-            default_model=gemini_model,
-            extra_args=gemini_extra_args,
+        self.antigravity_runner = CliTextRunner(
+            label=AGENT_ANTIGRAVITY,
+            cli_bin=antigravity_bin,
+            default_model=antigravity_model,
+            extra_args=antigravity_extra_args,
             workdir=codex_workdir,
-            timeout_sec=gemini_timeout,
-            base_args=gemini_base_args,
+            timeout_sec=antigravity_timeout,
+            base_args=antigravity_base_args,
         )
 
         self.codex_timeout_sec = codex_timeout
         self.codex_workdir = codex_workdir
         self.claude_timeout_sec = claude_timeout
-        self.gemini_timeout_sec = gemini_timeout
+        self.antigravity_timeout_sec = antigravity_timeout
         self.default_model_by_agent = {
             AGENT_CODEX: self.codex_runner.default_model,
             AGENT_CLAUDE: self.claude_runner.default_model,
-            AGENT_GEMINI: self.gemini_runner.default_model,
+            AGENT_ANTIGRAVITY: self.antigravity_runner.default_model,
         }
 
         self.telegram_api_timeout = max(telegram_api_timeout, 1.0)
@@ -1024,14 +1219,14 @@ class TelegramCodexBot:
             f"{truncate_for_prompt(codex_result)}"
         )
 
-    def _build_gemini_coding_assist_prompt(
+    def _build_antigravity_coding_assist_prompt(
         self,
         user_text: str,
         codex_result: str,
         claude_result: str,
     ) -> str:
         return (
-            "You are Gemini assist stage in a coding pipeline.\n"
+            "You are Antigravity assist stage in a coding pipeline.\n"
             "Do not rewrite the full solution. Provide high-leverage assistance only.\n"
             "Output sections:\n"
             "- Edge Cases\n"
@@ -1046,9 +1241,9 @@ class TelegramCodexBot:
             f"{truncate_for_prompt(claude_result, 8000)}"
         )
 
-    def _build_gemini_survey_prompt(self, user_text: str) -> str:
+    def _build_antigravity_survey_prompt(self, user_text: str) -> str:
         return (
-            "You are Gemini collector in a two-collector plus one-validator pipeline.\n"
+            "You are Antigravity collector in a two-collector plus one-validator pipeline.\n"
             "Task type: survey\n"
             "Return only:\n"
             "1) Key Findings\n"
@@ -1063,12 +1258,12 @@ class TelegramCodexBot:
         self,
         user_text: str,
         codex_result: str,
-        gemini_result: str,
+        antigravity_result: str,
     ) -> str:
         return (
             "You are Claude final validator and judge.\n"
             "Task type: survey\n"
-            "You are given two independent collector outputs (Codex and Gemini).\n"
+            "You are given two independent collector outputs (Codex and Antigravity).\n"
             "Cross-check them, resolve conflicts, and produce the best final answer.\n"
             "When uncertain, explicitly say uncertain.\n\n"
             "Output sections:\n"
@@ -1081,8 +1276,8 @@ class TelegramCodexBot:
             f"{user_text}\n\n"
             "[Codex collector]\n"
             f"{truncate_for_prompt(codex_result)}\n\n"
-            "[Gemini collector]\n"
-            f"{truncate_for_prompt(gemini_result)}"
+            "[Antigravity collector]\n"
+            f"{truncate_for_prompt(antigravity_result)}"
         )
 
     def _select_artifacts_to_send(
@@ -1145,7 +1340,7 @@ class TelegramCodexBot:
 
     @staticmethod
     def _normalize_agent_name(token: str) -> Optional[str]:
-        normalized = token.strip().lower()
+        normalized = normalize_agent_name(token)
         if normalized in SUPPORTED_AGENTS:
             return normalized
         return None
@@ -1201,6 +1396,92 @@ class TelegramCodexBot:
         )
         return any(token in normalized for token in tokens)
 
+    @staticmethod
+    def _compact_command_for_agent(agent: str) -> str:
+        normalized = normalize_agent_name(agent)
+        if normalized == AGENT_ANTIGRAVITY:
+            return "/compress"
+        return "/compact"
+
+    def _is_compaction_turn(self, turn_count: int) -> bool:
+        return turn_count > 0 and (turn_count % self.session_compact_every_turns == 0)
+
+    async def _maybe_auto_compact_codex_session(
+        self,
+        chat_id: int,
+        thread_id: Optional[str],
+        model: str,
+    ) -> Optional[str]:
+        if not thread_id:
+            return thread_id
+
+        turn_count = self.sessions.increment_agent_turn_count(chat_id, AGENT_CODEX)
+        if not self._is_compaction_turn(turn_count):
+            return thread_id
+
+        compact_prompt = self._compact_command_for_agent(AGENT_CODEX)
+        try:
+            _, compact_thread_id = await self.codex_runner.run_prompt(
+                prompt=compact_prompt,
+                thread_id=thread_id,
+                model=model,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "auto compact skipped for codex chat_id=%s turn=%s: %s",
+                chat_id,
+                turn_count,
+                exc,
+            )
+            return thread_id
+
+        resolved_thread_id = compact_thread_id or thread_id
+        self.sessions.set_thread_id(chat_id, resolved_thread_id)
+        self.logger.info(
+            "auto compact executed for codex chat_id=%s turn=%s",
+            chat_id,
+            turn_count,
+        )
+        return resolved_thread_id
+
+    async def _maybe_auto_compact_text_session(
+        self,
+        chat_id: int,
+        agent: str,
+        runner: CliTextRunner,
+        model: str,
+        session_id: Optional[str],
+    ) -> None:
+        normalized_agent = self._normalize_agent_name(agent)
+        if normalized_agent is None or not session_id:
+            return
+
+        turn_count = self.sessions.increment_agent_turn_count(chat_id, normalized_agent)
+        if not self._is_compaction_turn(turn_count):
+            return
+
+        compact_prompt = self._compact_command_for_agent(normalized_agent)
+        try:
+            await runner.run_prompt(
+                prompt=compact_prompt,
+                model=model,
+                resume_session_id=session_id,
+            )
+            self.logger.info(
+                "auto compact executed for %s chat_id=%s turn=%s",
+                normalized_agent,
+                chat_id,
+                turn_count,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "auto compact skipped for %s chat_id=%s turn=%s: %s",
+                normalized_agent,
+                chat_id,
+                turn_count,
+                exc,
+            )
+
     async def _run_stateful_text_agent(
         self,
         chat_id: int,
@@ -1210,9 +1491,12 @@ class TelegramCodexBot:
         model: str,
     ) -> str:
         existing_session_id = self.sessions.get_agent_session_id(chat_id, agent)
+        active_session_id = existing_session_id
+        reply = ""
+
         if existing_session_id:
             try:
-                return await runner.run_prompt(
+                reply = await runner.run_prompt(
                     prompt=prompt,
                     model=model,
                     resume_session_id=existing_session_id,
@@ -1227,14 +1511,26 @@ class TelegramCodexBot:
                     existing_session_id,
                     exc,
                 )
+                active_session_id = None
 
-        new_session_id = str(uuid.uuid4())
-        reply = await runner.run_prompt(
-            prompt=prompt,
+        if not reply:
+            new_session_id = str(uuid.uuid4())
+            reply = await runner.run_prompt(
+                prompt=prompt,
+                model=model,
+                session_id=new_session_id,
+            )
+            self.sessions.set_agent_session_id(chat_id, agent, new_session_id)
+            self.sessions.reset_agent_turn_count(chat_id, agent)
+            active_session_id = new_session_id
+
+        await self._maybe_auto_compact_text_session(
+            chat_id=chat_id,
+            agent=agent,
+            runner=runner,
             model=model,
-            session_id=new_session_id,
+            session_id=active_session_id,
         )
-        self.sessions.set_agent_session_id(chat_id, agent, new_session_id)
         return reply
 
     async def _run_coding_pipeline(self, update: Update, chat_id: int, user_text: str) -> str:
@@ -1244,13 +1540,14 @@ class TelegramCodexBot:
         thread_id = self.sessions.get_thread_id(chat_id)
         codex_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
         claude_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
-        gemini_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+        antigravity_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_ANTIGRAVITY)
 
         codex_prompt = self._build_codex_coding_prompt(
             thread_id=thread_id,
             user_text=user_text,
             artifact_dir=artifact_dir,
         )
+        previous_thread_id = thread_id
 
         codex_result, new_thread_id = await self.codex_runner.run_prompt(
             prompt=codex_prompt,
@@ -1258,7 +1555,17 @@ class TelegramCodexBot:
             model=codex_model,
         )
         if new_thread_id:
+            thread_id = new_thread_id
             self.sessions.set_thread_id(chat_id, new_thread_id)
+            if new_thread_id != previous_thread_id:
+                self.sessions.reset_agent_turn_count(chat_id, AGENT_CODEX)
+        thread_id = await self._maybe_auto_compact_codex_session(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            model=codex_model,
+        )
+        if thread_id:
+            self.sessions.set_thread_id(chat_id, thread_id)
 
         claude_prompt = self._build_claude_coding_review_prompt(
             user_text=user_text,
@@ -1273,17 +1580,17 @@ class TelegramCodexBot:
             model=claude_model,
         )
 
-        gemini_prompt = self._build_gemini_coding_assist_prompt(
+        antigravity_prompt = self._build_antigravity_coding_assist_prompt(
             user_text=user_text,
             codex_result=codex_result,
             claude_result=claude_result,
         )
-        gemini_result = await self._run_stateful_text_agent(
+        antigravity_result = await self._run_stateful_text_agent(
             chat_id=chat_id,
-            agent=AGENT_GEMINI,
-            runner=self.gemini_runner,
-            prompt=gemini_prompt,
-            model=gemini_model,
+            agent=AGENT_ANTIGRAVITY,
+            runner=self.antigravity_runner,
+            prompt=antigravity_prompt,
+            model=antigravity_model,
         )
 
         return (
@@ -1295,7 +1602,7 @@ class TelegramCodexBot:
             "[Claude]\n"
             f"{claude_result}\n\n"
             "[Gemini]\n"
-            f"{gemini_result}"
+            f"{antigravity_result}"
         )
 
     async def _run_codex_direct(self, chat_id: int, user_text: str) -> str:
@@ -1309,13 +1616,24 @@ class TelegramCodexBot:
             user_text=user_text,
             artifact_dir=artifact_dir,
         )
+        previous_thread_id = thread_id
         reply_text, new_thread_id = await self.codex_runner.run_prompt(
             prompt=prompt,
             thread_id=thread_id,
             model=codex_model,
         )
         if new_thread_id:
+            thread_id = new_thread_id
             self.sessions.set_thread_id(chat_id, new_thread_id)
+            if new_thread_id != previous_thread_id:
+                self.sessions.reset_agent_turn_count(chat_id, AGENT_CODEX)
+        thread_id = await self._maybe_auto_compact_codex_session(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            model=codex_model,
+        )
+        if thread_id:
+            self.sessions.set_thread_id(chat_id, thread_id)
         return reply_text
 
     async def _run_survey_pipeline(self, update: Update, chat_id: int, user_text: str) -> str:
@@ -1325,30 +1643,30 @@ class TelegramCodexBot:
 
         codex_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
         claude_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
-        gemini_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+        antigravity_model, _ = self._resolve_agent_model_for_chat(chat_id, AGENT_ANTIGRAVITY)
         codex_prompt = self._build_codex_survey_prompt(user_text=user_text, artifact_dir=artifact_dir)
-        gemini_prompt = self._build_gemini_survey_prompt(user_text=user_text)
+        antigravity_prompt = self._build_antigravity_survey_prompt(user_text=user_text)
 
         codex_task = self.codex_runner.run_prompt(
             prompt=codex_prompt,
             thread_id=None,
             model=codex_model,
         )
-        gemini_task = self._run_stateful_text_agent(
+        antigravity_task = self._run_stateful_text_agent(
             chat_id=chat_id,
-            agent=AGENT_GEMINI,
-            runner=self.gemini_runner,
-            prompt=gemini_prompt,
-            model=gemini_model,
+            agent=AGENT_ANTIGRAVITY,
+            runner=self.antigravity_runner,
+            prompt=antigravity_prompt,
+            model=antigravity_model,
         )
 
         codex_result = ""
-        gemini_result = ""
+        antigravity_result = ""
 
         codex_exc: Optional[BaseException] = None
-        gemini_exc: Optional[BaseException] = None
+        antigravity_exc: Optional[BaseException] = None
 
-        codex_out, gemini_out = await asyncio.gather(codex_task, gemini_task, return_exceptions=True)
+        codex_out, antigravity_out = await asyncio.gather(codex_task, antigravity_task, return_exceptions=True)
 
         if isinstance(codex_out, Exception):
             codex_exc = codex_out
@@ -1356,26 +1674,26 @@ class TelegramCodexBot:
         else:
             codex_result = codex_out[0]
 
-        if isinstance(gemini_out, Exception):
-            gemini_exc = gemini_out
-            self.logger.warning("survey gemini collector failed: %s", gemini_exc)
+        if isinstance(antigravity_out, Exception):
+            antigravity_exc = antigravity_out
+            self.logger.warning("survey antigravity collector failed: %s", antigravity_exc)
         else:
-            gemini_result = gemini_out
+            antigravity_result = antigravity_out
 
-        if codex_exc and gemini_exc:
+        if codex_exc and antigravity_exc:
             raise RuntimeError(
-                f"collector failed: codex={codex_exc}; gemini={gemini_exc}"
+                f"collector failed: codex={codex_exc}; gemini={antigravity_exc}"
             )
 
         if not codex_result:
             codex_result = f"Codex collector failed: {codex_exc}"
-        if not gemini_result:
-            gemini_result = f"Gemini collector failed: {gemini_exc}"
+        if not antigravity_result:
+            antigravity_result = f"Gemini collector failed: {antigravity_exc}"
 
         claude_prompt = self._build_claude_validation_prompt(
             user_text=user_text,
             codex_result=codex_result,
-            gemini_result=gemini_result,
+            antigravity_result=antigravity_result,
         )
         claude_result = await self._run_stateful_text_agent(
             chat_id=chat_id,
@@ -1478,12 +1796,13 @@ class TelegramCodexBot:
             update,
             "Send any text and I will route it automatically.\n"
             "- default: codex direct response\n"
-            "- code task (code content detected): codex -> claude -> gemini, prefixed with [code]\n"
-            "- survey task (조사/리서치 request): gemini+codex -> claude, prefixed with [survey]\n"
-            "Use /model <agent> <name> to override model (agent: codex|claude|gemini).\n"
+            "- code task (code content detected): codex -> claude -> antigravity, prefixed with [code]\n"
+            "- survey task (조사/리서치 request): antigravity+codex -> claude, prefixed with [survey]\n"
+            "Use /model <agent> <name> to override model (agent: codex|claude|antigravity).\n"
             "Use /model <agent> clear to reset override.\n"
             "Use /session to view mapped sessions.\n"
-            "Use /reset [agent|all] to clear mapped sessions.",
+            "Use /reset [agent|all] to clear mapped sessions.\n"
+            f"Auto compact runs every {self.session_compact_every_turns} turns per agent session.",
         )
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1612,6 +1931,7 @@ class TelegramCodexBot:
         lines: list[str] = []
         for agent in SUPPORTED_AGENTS:
             lines.append(f"{agent}_session_id={mapped.get(agent, '(none)')}")
+            lines.append(f"{agent}_turn_count={self.sessions.get_agent_turn_count(chat_id, agent)}")
         await self._reply_update_text(update, "\n".join(lines))
 
     async def cmd_whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1625,14 +1945,20 @@ class TelegramCodexBot:
         codex_source = ""
         claude_model = ""
         claude_source = ""
-        gemini_model = ""
-        gemini_source = ""
+        antigravity_model = ""
+        antigravity_source = ""
         mapped_sessions: dict[str, str] = {}
+        codex_turn_count = 0
+        claude_turn_count = 0
+        antigravity_turn_count = 0
         if chat_id is not None:
             codex_model, codex_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CODEX)
             claude_model, claude_source = self._resolve_agent_model_for_chat(chat_id, AGENT_CLAUDE)
-            gemini_model, gemini_source = self._resolve_agent_model_for_chat(chat_id, AGENT_GEMINI)
+            antigravity_model, antigravity_source = self._resolve_agent_model_for_chat(chat_id, AGENT_ANTIGRAVITY)
             mapped_sessions = self.sessions.list_agent_sessions(chat_id)
+            codex_turn_count = self.sessions.get_agent_turn_count(chat_id, AGENT_CODEX)
+            claude_turn_count = self.sessions.get_agent_turn_count(chat_id, AGENT_CLAUDE)
+            antigravity_turn_count = self.sessions.get_agent_turn_count(chat_id, AGENT_ANTIGRAVITY)
 
         await self._reply_update_text(
             update,
@@ -1642,16 +1968,20 @@ class TelegramCodexBot:
                 f"codex_workdir={self.codex_workdir}\n"
                 f"codex_timeout_sec={self.codex_timeout_sec}\n"
                 f"claude_timeout_sec={self.claude_timeout_sec}\n"
-                f"gemini_timeout_sec={self.gemini_timeout_sec}\n"
+                f"antigravity_timeout_sec={self.antigravity_timeout_sec}\n"
+                f"session_compact_every_turns={self.session_compact_every_turns}\n"
                 f"codex_model={codex_model or '(codex default)'}\n"
                 f"codex_model_source={codex_source or '(none)'}\n"
                 f"claude_model={claude_model or '(none)'}\n"
                 f"claude_model_source={claude_source or '(none)'}\n"
-                f"gemini_model={gemini_model or '(none)'}\n"
-                f"gemini_model_source={gemini_source or '(none)'}\n"
+                f"antigravity_model={antigravity_model or '(none)'}\n"
+                f"antigravity_model_source={antigravity_source or '(none)'}\n"
                 f"codex_session_id={mapped_sessions.get(AGENT_CODEX, '(none)')}\n"
                 f"claude_session_id={mapped_sessions.get(AGENT_CLAUDE, '(none)')}\n"
-                f"gemini_session_id={mapped_sessions.get(AGENT_GEMINI, '(none)')}"
+                f"antigravity_session_id={mapped_sessions.get(AGENT_ANTIGRAVITY, '(none)')}\n"
+                f"codex_turn_count={codex_turn_count}\n"
+                f"claude_turn_count={claude_turn_count}\n"
+                f"antigravity_turn_count={antigravity_turn_count}"
             ),
         )
 
@@ -1759,7 +2089,7 @@ class TelegramCodexBot:
 
     def run(self) -> None:
         app = self.build_application()
-        self.logger.info("Bot started with multi-agent backend (codex+claude+gemini)")
+        self.logger.info("Bot started with multi-agent backend (codex+claude+antigravity)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
