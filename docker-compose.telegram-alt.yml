@@ -11,6 +11,8 @@ services:
       - ${HOME}/.codex:/root/.codex
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.antigravity:/root/.antigravity
+      # AGY persists auth/session state under ~/.gemini/antigravity-cli.
+      - ${HOME}/.gemini:/root/.gemini
       - type: bind
         source: ${HOME}/.claude.json
         target: /root/.claude.json

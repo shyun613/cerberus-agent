@@ -16,6 +16,7 @@ venv/
 # Local tool state
 .codex/
 codex_home/
+.antigravitycli/
 
 # Runtime data (generated at run time)
 data/sessions.sqlite3

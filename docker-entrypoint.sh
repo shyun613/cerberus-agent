@@ -12,4 +12,11 @@ if [[ ! -f "$CLAUDE_CONFIG_FILE" ]] && [[ -d "$CLAUDE_BACKUP_DIR" ]]; then
   fi
 fi
 
+# AGY in headless containers may ignore file-based local auth unless it detects SSH context.
+# Force a synthetic SSH_CONNECTION when explicitly enabled.
+force_file_auth="${ANTIGRAVITY_FORCE_FILE_AUTH:-true}"
+if [[ "$force_file_auth" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]] && [[ -z "${SSH_CONNECTION:-}" ]]; then
+  export SSH_CONNECTION="127.0.0.1 0 127.0.0.1 0"
+fi
+
 exec python bot.py

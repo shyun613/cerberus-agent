@@ -45,6 +45,7 @@ docker_args=(
   -v "$HOME/.codex:/root/.codex"
   -v "$HOME/.claude:/root/.claude"
   -v "$HOME/.antigravity:/root/.antigravity"
+  -v "$HOME/.gemini:/root/.gemini"
   --restart unless-stopped
 )
 

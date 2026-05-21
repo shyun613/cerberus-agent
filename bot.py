@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 import shlex
 import sqlite3
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, Set
@@ -281,6 +283,15 @@ class SessionStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_activity (
+                    chat_id INTEGER PRIMARY KEY,
+                    last_user_request_unix REAL NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             # Backfill legacy codex thread mappings if present.
             conn.execute(
                 """
@@ -391,6 +402,37 @@ class SessionStore:
             deleted_rows += turn_cursor.rowcount
             conn.commit()
         return deleted_rows > 0
+
+    def get_last_user_request_unix(self, chat_id: int) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_user_request_unix FROM chat_activity WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = float(row[0])
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    def set_last_user_request_unix(self, chat_id: int, timestamp_unix: float) -> None:
+        normalized_timestamp = max(float(timestamp_unix), 0.0)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_activity (chat_id, last_user_request_unix, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    last_user_request_unix = excluded.last_user_request_unix,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, normalized_timestamp),
+            )
+            conn.commit()
 
     def get_agent_turn_count(self, chat_id: int, agent: str) -> int:
         normalized_agent = self._validate_agent(agent)
@@ -694,14 +736,19 @@ class CliTextRunner:
         cmd = [self.cli_bin, *self.base_args]
         resolved_resume_session_id = (resume_session_id or "").strip()
         resolved_session_id = (session_id or "").strip()
-        if resolved_resume_session_id:
-            cmd.extend(["--resume", resolved_resume_session_id])
-        elif resolved_session_id:
-            cmd.extend(["--session-id", resolved_session_id])
+        if self.label == AGENT_ANTIGRAVITY:
+            # AGY print mode supports --conversation for resuming.
+            if resolved_resume_session_id:
+                cmd.extend(["--conversation", resolved_resume_session_id])
+        else:
+            if resolved_resume_session_id:
+                cmd.extend(["--resume", resolved_resume_session_id])
+            elif resolved_session_id:
+                cmd.extend(["--session-id", resolved_session_id])
 
-        resolved_model = (model or "").strip() or self.default_model
-        if resolved_model:
-            cmd.extend(["--model", resolved_model])
+            resolved_model = (model or "").strip() or self.default_model
+            if resolved_model:
+                cmd.extend(["--model", resolved_model])
         cmd.extend(self.extra_args)
         if self.label == AGENT_ANTIGRAVITY:
             cmd.extend(["--prompt", prompt])
@@ -727,6 +774,11 @@ class CliTextRunner:
         if self.label == AGENT_ANTIGRAVITY:
             trust_workspace = os.getenv("ANTIGRAVITY_CLI_TRUST_WORKSPACE", "true").strip()
             env.setdefault("ANTIGRAVITY_CLI_TRUST_WORKSPACE", trust_workspace)
+            # In headless containers, AGY keyring auth often fails.
+            # Force SSH-style file token flow unless explicitly disabled.
+            force_file_auth = os.getenv("ANTIGRAVITY_FORCE_FILE_AUTH", "true").strip().lower()
+            if force_file_auth in {"1", "true", "yes", "on"} and not env.get("SSH_CONNECTION"):
+                env["SSH_CONNECTION"] = "127.0.0.1 0 127.0.0.1 0"
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -825,7 +877,6 @@ class TelegramCodexBot:
             claude_permission_mode = "acceptEdits"
 
         antigravity_bin = os.getenv("ANTIGRAVITY_BIN", "agy").strip() or "agy"
-        antigravity_model = os.getenv("ANTIGRAVITY_MODEL", "").strip()
         antigravity_extra_args = shlex.split(os.getenv("ANTIGRAVITY_EXTRA_ARGS", ""))
         antigravity_timeout = int(os.getenv("ANTIGRAVITY_TIMEOUT_SEC", str(codex_timeout)))
         antigravity_approval_mode = os.getenv("ANTIGRAVITY_APPROVAL_MODE", "yolo").strip()
@@ -838,6 +889,19 @@ class TelegramCodexBot:
             default=5,
             min_value=1,
         )
+        self.session_idle_clear_after_sec = max(
+            float(os.getenv("SESSION_IDLE_CLEAR_AFTER_SEC", "3600")),
+            0.0,
+        )
+        self.request_dedupe_window_sec = max(
+            float(os.getenv("REQUEST_DEDUPE_WINDOW_SEC", "20")),
+            0.0,
+        )
+        self._dedupe_lock = asyncio.Lock()
+        self._session_idle_lock = asyncio.Lock()
+        self._inflight_update_ids: set[int] = set()
+        self._recent_update_ids: dict[int, float] = {}
+        self._recent_request_keys: dict[str, float] = {}
 
         self.codex_runner = CodexRunner(
             codex_bin=codex_bin,
@@ -861,14 +925,20 @@ class TelegramCodexBot:
             base_args=claude_base_args,
         )
 
-        antigravity_base_args = ["--output-format", "text"]
-        if antigravity_approval_mode:
-            antigravity_base_args.extend(["--approval-mode", antigravity_approval_mode])
+        antigravity_base_args: list[str] = []
+        if antigravity_approval_mode.lower() in {
+            "yolo",
+            "dangerously-skip-permissions",
+            "always",
+            "always-proceed",
+            "auto",
+        }:
+            antigravity_base_args.append("--dangerously-skip-permissions")
 
         self.antigravity_runner = CliTextRunner(
             label=AGENT_ANTIGRAVITY,
             cli_bin=antigravity_bin,
-            default_model=antigravity_model,
+            default_model="",
             extra_args=antigravity_extra_args,
             workdir=codex_workdir,
             timeout_sec=antigravity_timeout,
@@ -1238,6 +1308,9 @@ class TelegramCodexBot:
         if normalized_agent is None:
             return "", "unsupported_agent"
 
+        if normalized_agent == AGENT_ANTIGRAVITY:
+            return "", "not_supported_in_agy_print_mode"
+
         chat_model = self.sessions.get_agent_model(chat_id, normalized_agent)
         if chat_model:
             return chat_model, "chat_override"
@@ -1378,6 +1451,16 @@ class TelegramCodexBot:
         prompt: str,
         model: str,
     ) -> str:
+        normalized_agent = self._normalize_agent_name(agent)
+        if normalized_agent == AGENT_ANTIGRAVITY:
+            # AGY currently does not support explicit --session-id or --model flags in print mode.
+            # Run statelessly to avoid cross-chat conversation bleed via --continue.
+            self.sessions.clear_agent_session_id(chat_id, AGENT_ANTIGRAVITY)
+            return await runner.run_prompt(
+                prompt=prompt,
+                model="",
+            )
+
         existing_session_id = self.sessions.get_agent_session_id(chat_id, agent)
         active_session_id = existing_session_id
         reply = ""
@@ -1654,6 +1737,87 @@ class TelegramCodexBot:
     def _resolve_task_kind(self, user_text: str) -> str:
         return classify_task(user_text)
 
+    @staticmethod
+    def _hash_request_payload(payload: str) -> str:
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+    def _prune_dedupe_state(self, now_monotonic: float) -> None:
+        window = max(self.request_dedupe_window_sec, 1.0)
+        stale_updates = [
+            update_id
+            for update_id, ts in self._recent_update_ids.items()
+            if now_monotonic - ts > window
+        ]
+        for update_id in stale_updates:
+            self._recent_update_ids.pop(update_id, None)
+
+        stale_requests = [
+            key
+            for key, ts in self._recent_request_keys.items()
+            if now_monotonic - ts > window
+        ]
+        for key in stale_requests:
+            self._recent_request_keys.pop(key, None)
+
+    async def _claim_request_execution(self, update_id: int, request_key: str) -> tuple[bool, str]:
+        now_monotonic = time.monotonic()
+        async with self._dedupe_lock:
+            self._prune_dedupe_state(now_monotonic)
+
+            if update_id in self._inflight_update_ids or update_id in self._recent_update_ids:
+                return False, "duplicate_update"
+
+            if self.request_dedupe_window_sec > 0:
+                last_seen = self._recent_request_keys.get(request_key)
+                if last_seen is not None and now_monotonic - last_seen <= self.request_dedupe_window_sec:
+                    return False, "duplicate_request_window"
+
+            self._inflight_update_ids.add(update_id)
+            return True, ""
+
+    async def _finish_request_execution(self, update_id: int, request_key: str, success: bool) -> None:
+        now_monotonic = time.monotonic()
+        async with self._dedupe_lock:
+            self._inflight_update_ids.discard(update_id)
+            if success:
+                self._recent_update_ids[update_id] = now_monotonic
+                if self.request_dedupe_window_sec > 0:
+                    self._recent_request_keys[request_key] = now_monotonic
+            self._prune_dedupe_state(now_monotonic)
+
+    async def _maybe_auto_clear_idle_sessions(self, update: Update, chat_id: int) -> None:
+        if self.session_idle_clear_after_sec <= 0:
+            return
+
+        now_unix = time.time()
+        idle_for_sec = 0.0
+        cleared = False
+        async with self._session_idle_lock:
+            last_user_request_unix = self.sessions.get_last_user_request_unix(chat_id)
+            self.sessions.set_last_user_request_unix(chat_id, now_unix)
+            if last_user_request_unix is None:
+                return
+            idle_for_sec = now_unix - last_user_request_unix
+            if idle_for_sec < self.session_idle_clear_after_sec:
+                return
+            cleared = self.sessions.clear_all_sessions(chat_id)
+
+        self.logger.info(
+            "idle auto-clear checked chat_id=%s idle_for_sec=%.2f threshold_sec=%.2f cleared=%s",
+            chat_id,
+            idle_for_sec,
+            self.session_idle_clear_after_sec,
+            cleared,
+        )
+        if cleared:
+            await self._reply_update_text(
+                update,
+                (
+                    "Chat was idle for too long, so all mapped sessions were cleared "
+                    "before processing this request."
+                ),
+            )
+
     def is_allowed(self, update: Update) -> bool:
         chat = update.effective_chat
         user = update.effective_user
@@ -1690,7 +1854,8 @@ class TelegramCodexBot:
             "Use /model <agent> clear to reset override.\n"
             "Use /session to view mapped sessions.\n"
             "Use /reset [agent|all] to clear mapped sessions.\n"
-            f"Auto compact runs every {self.session_compact_every_turns} turns per agent session.",
+            f"Auto compact runs every {self.session_compact_every_turns} turns per agent session.\n"
+            f"Auto reset after idle: {int(self.session_idle_clear_after_sec)} seconds (0=disabled).",
         )
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1737,6 +1902,13 @@ class TelegramCodexBot:
                 await self._reply_update_text(
                     update,
                     f"{prefix}\n{self._format_model_status(chat_id)}",
+                )
+                return
+
+            if agent == AGENT_ANTIGRAVITY:
+                await self._reply_update_text(
+                    update,
+                    "antigravity model override is not supported in AGY print mode.",
                 )
                 return
 
@@ -1858,6 +2030,7 @@ class TelegramCodexBot:
                 f"claude_timeout_sec={self.claude_timeout_sec}\n"
                 f"antigravity_timeout_sec={self.antigravity_timeout_sec}\n"
                 f"session_compact_every_turns={self.session_compact_every_turns}\n"
+                f"session_idle_clear_after_sec={self.session_idle_clear_after_sec}\n"
                 f"codex_model={codex_model or '(codex default)'}\n"
                 f"codex_model_source={codex_source or '(none)'}\n"
                 f"claude_model={claude_model or '(none)'}\n"
@@ -1886,13 +2059,36 @@ class TelegramCodexBot:
 
         chat_id = update.effective_chat.id
         task_kind = self._resolve_task_kind(user_text)
+        update_id = int(update.update_id)
+        dedupe_payload = task_kind + "\n" + user_text
+        request_key = f"text:{chat_id}:{self._hash_request_payload(dedupe_payload)}"
+        claimed, reason = await self._claim_request_execution(update_id, request_key)
+        if not claimed:
+            self.logger.info(
+                "duplicate text request skipped chat_id=%s update_id=%s reason=%s",
+                chat_id,
+                update_id,
+                reason,
+            )
+            if reason == "duplicate_request_window":
+                await self._reply_update_text(
+                    update,
+                    f"Duplicate request ignored (within {int(self.request_dedupe_window_sec)}s window).",
+                )
+            return
 
-        await self._run_pipeline_for_task(
-            update=update,
-            chat_id=chat_id,
-            user_text=user_text,
-            task_kind=task_kind,
-        )
+        success = False
+        try:
+            await self._maybe_auto_clear_idle_sessions(update=update, chat_id=chat_id)
+            await self._run_pipeline_for_task(
+                update=update,
+                chat_id=chat_id,
+                user_text=user_text,
+                task_kind=task_kind,
+            )
+            success = True
+        finally:
+            await self._finish_request_execution(update_id, request_key, success=success)
 
     async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -1903,6 +2099,35 @@ class TelegramCodexBot:
 
         chat_id = update.effective_chat.id
         document = update.message.document
+        caption = (update.message.caption or "").strip()
+        update_id = int(update.update_id)
+        dedupe_payload = "\n".join(
+            [
+                str(chat_id),
+                document.file_unique_id,
+                document.file_name or "",
+                document.mime_type or "",
+                str(document.file_size if document.file_size is not None else ""),
+                caption,
+            ]
+        )
+        request_key = f"document:{chat_id}:{self._hash_request_payload(dedupe_payload)}"
+        claimed, reason = await self._claim_request_execution(update_id, request_key)
+        if not claimed:
+            self.logger.info(
+                "duplicate document request skipped chat_id=%s update_id=%s reason=%s",
+                chat_id,
+                update_id,
+                reason,
+            )
+            if reason == "duplicate_request_window":
+                await self._reply_update_text(
+                    update,
+                    f"Duplicate request ignored (within {int(self.request_dedupe_window_sec)}s window).",
+                )
+            return
+
+        await self._maybe_auto_clear_idle_sessions(update=update, chat_id=chat_id)
 
         chat_upload_dir = self.upload_dir / str(chat_id)
         chat_upload_dir.mkdir(parents=True, exist_ok=True)
@@ -1921,9 +2146,9 @@ class TelegramCodexBot:
         except Exception as exc:
             self.logger.exception("document download failed")
             await self._reply_update_text(update, f"Failed to download file: {exc}")
+            await self._finish_request_execution(update_id, request_key, success=False)
             return
 
-        caption = (update.message.caption or "").strip()
         prompt_lines = [
             "[Uploaded file]",
             f"path={save_path}",
@@ -1937,13 +2162,17 @@ class TelegramCodexBot:
 
         user_text = "\n".join(prompt_lines)
         task_kind = self._resolve_task_kind(user_text)
-
-        await self._run_pipeline_for_task(
-            update=update,
-            chat_id=chat_id,
-            user_text=user_text,
-            task_kind=task_kind,
-        )
+        success = False
+        try:
+            await self._run_pipeline_for_task(
+                update=update,
+                chat_id=chat_id,
+                user_text=user_text,
+                task_kind=task_kind,
+            )
+            success = True
+        finally:
+            await self._finish_request_execution(update_id, request_key, success=success)
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.logger.exception("Unhandled telegram exception", exc_info=context.error)

@@ -27,6 +27,7 @@ For stable restarts, keep these mounted:
 - `/root/.claude` (Claude auth/session)
 - `/root/.claude.json` (Claude CLI config file)
 - `/root/.antigravity` (Antigravity auth/session)
+- `/root/.gemini` (AGY runtime state: auth/cache/conversations under `~/.gemini/antigravity-cli`)
 - `/app/data` (chat session DB, uploads, generated files)
 
 If `/root/.claude.json` is missing but `/root/.claude/backups` exists, `docker-entrypoint.sh` restores the latest backup automatically.
@@ -52,19 +53,21 @@ Main optional vars:
 - `CODEX_BIN`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`, `CODEX_WORKDIR`, `CODEX_TIMEOUT_SEC`
 - `CODEX_SYSTEM_PROMPT`
 - `CLAUDE_BIN`, `CLAUDE_MODEL` (default: `claude-sonnet-4-6`), `CLAUDE_EXTRA_ARGS`, `CLAUDE_TIMEOUT_SEC`, `CLAUDE_PERMISSION_MODE` (default: `acceptEdits`)
-- `ANTIGRAVITY_BIN` (default: `agy`), `ANTIGRAVITY_MODEL` (default: CLI default), `ANTIGRAVITY_EXTRA_ARGS`, `ANTIGRAVITY_TIMEOUT_SEC`, `ANTIGRAVITY_APPROVAL_MODE`, `ANTIGRAVITY_CLI_TRUST_WORKSPACE` (default: `true`)
+- `ANTIGRAVITY_BIN` (default: `agy`), `ANTIGRAVITY_EXTRA_ARGS`, `ANTIGRAVITY_TIMEOUT_SEC`, `ANTIGRAVITY_APPROVAL_MODE`, `ANTIGRAVITY_CLI_TRUST_WORKSPACE` (default: `true`), `ANTIGRAVITY_FORCE_FILE_AUTH` (default: `true` for headless container auth)
+- `SSH_CONNECTION` (optional; set to `127.0.0.1 0 127.0.0.1 0` in headless containers to force AGY file-token auth path)
+- `REQUEST_DEDUPE_WINDOW_SEC` (default: `20`, skip duplicate update/payload execution in short window)
 - `UPLOAD_DIR`, `GENERATED_FILES_DIR`, `MAX_RETURN_FILES`, `MAX_RETURN_FILE_SIZE_MB`
 - `SESSION_DB_PATH`
 - `SESSION_COMPACT_EVERY_TURNS` (default: `5`, auto compact per agent session)
+- `SESSION_IDLE_CLEAR_AFTER_SEC` (default: `3600`, auto-clear mapped sessions after idle gap; `0` disables)
 - `ALLOWED_CHAT_IDS`, `ALLOWED_USER_IDS`
 - `TELEGRAM_API_TIMEOUT_SEC`, `TELEGRAM_SEND_RETRIES`, `TELEGRAM_SEND_RETRY_DELAY_SEC`
 - `LOG_LEVEL`
 
 Model resolution priority (per agent):
 
-- chat override via `/model <agent> <name>`
-- `*_MODEL` from env (`CODEX_MODEL`, `CLAUDE_MODEL`, `ANTIGRAVITY_MODEL`)
-- each CLI's own default (if env/default is blank)
+- `codex` / `claude`: chat override via `/model <agent> <name>` -> `*_MODEL` from env -> CLI default
+- `antigravity`: AGY print mode does not expose `--model`; bot-side model override/env model is not applied
 
 ## 2) Verify host logins
 
@@ -77,8 +80,10 @@ agy --version
 For `antigravity`, a quick headless check also works:
 
 ```bash
-agy --prompt "Reply with exactly: OK" --output-format text
+agy --prompt "Reply with exactly: OK"
 ```
+
+When `ANTIGRAVITY_FORCE_FILE_AUTH=true`, the bot process uses a synthetic `SSH_CONNECTION` to keep AGY on mounted local file auth in headless mode. Setting `SSH_CONNECTION` in env file applies this to manual `docker exec` checks as well.
 
 ## 3) Start with Docker Compose
 
@@ -109,6 +114,7 @@ docker run -d \
   -v "$HOME/.codex:/root/.codex" \
   -v "$HOME/.claude:/root/.claude" \
   -v "$HOME/.antigravity:/root/.antigravity" \
+  -v "$HOME/.gemini:/root/.gemini" \
   --restart unless-stopped \
   telegram-openai-bot:local
 ```
@@ -161,7 +167,7 @@ docker stop telegram-openai-bot && docker rm telegram-openai-bot
 - `/model` (show codex/claude/antigravity effective models and sources)
 - `/model <name>` (legacy: set codex model)
 - `/model clear` (legacy: clear codex override)
-- `/model <agent> <name>` (`agent`: `codex|claude|antigravity`)
+- `/model <agent> <name>` (`agent`: `codex|claude`; `antigravity` model override unsupported)
 - `/model <agent> clear`
 - `/session` (show mapped session IDs + per-agent turn counters)
 - `/reset` (clear all mapped sessions)
@@ -173,6 +179,10 @@ Session compaction:
 
 - Every `SESSION_COMPACT_EVERY_TURNS` turns (default `5`), each agent session auto-compacts.
 - Commands: `codex=/compact`, `claude=/compact`, `antigravity=/compress`.
+
+Session idle auto-clear:
+
+- If no new user request arrives for `SESSION_IDLE_CLEAR_AFTER_SEC` seconds (default `3600`), all mapped sessions are cleared before processing the next request.
 
 Document uploads are supported. The bot downloads the file to `UPLOAD_DIR` and runs the same routing policy.
 
