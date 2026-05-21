@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -24,11 +23,7 @@ TASK_SURVEY = "survey"
 AGENT_CODEX = "codex"
 AGENT_CLAUDE = "claude"
 AGENT_ANTIGRAVITY = "antigravity"
-LEGACY_AGENT_GEMINI = "gemini"
 SUPPORTED_AGENTS = (AGENT_CODEX, AGENT_CLAUDE, AGENT_ANTIGRAVITY)
-AGENT_NAME_ALIASES = {
-    LEGACY_AGENT_GEMINI: AGENT_ANTIGRAVITY,
-}
 
 
 def parse_id_set(raw: str) -> Set[int]:
@@ -206,28 +201,7 @@ def classify_task(user_text: str) -> str:
 
 
 def normalize_agent_name(token: str) -> str:
-    normalized = token.strip().lower()
-    return AGENT_NAME_ALIASES.get(normalized, normalized)
-
-
-def read_env_with_legacy(primary_key: str, legacy_key: str, default: str = "") -> str:
-    primary = os.getenv(primary_key, "").strip()
-    if primary:
-        return primary
-    legacy = os.getenv(legacy_key, "").strip()
-    if legacy:
-        return legacy
-    return default
-
-
-def read_int_env_with_legacy(primary_key: str, legacy_key: str, default: int) -> int:
-    primary = os.getenv(primary_key, "").strip()
-    if primary:
-        return int(primary)
-    legacy = os.getenv(legacy_key, "").strip()
-    if legacy:
-        return int(legacy)
-    return default
+    return token.strip().lower()
 
 
 def strip_cli_noise(text: str) -> str:
@@ -326,53 +300,6 @@ class SessionStore:
                 WHERE 1
                 ON CONFLICT(chat_id, agent) DO NOTHING
                 """
-            )
-            # Migrate legacy gemini agent rows to antigravity.
-            conn.execute(
-                """
-                INSERT INTO chat_agent_sessions (chat_id, agent, session_id, updated_at)
-                SELECT chat_id, ?, session_id, updated_at
-                FROM chat_agent_sessions
-                WHERE agent = ?
-                ON CONFLICT(chat_id, agent) DO NOTHING
-                """,
-                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
-            )
-            conn.execute(
-                "DELETE FROM chat_agent_sessions WHERE agent = ?",
-                (LEGACY_AGENT_GEMINI,),
-            )
-
-            conn.execute(
-                """
-                INSERT INTO chat_agent_models (chat_id, agent, model, updated_at)
-                SELECT chat_id, ?, model, updated_at
-                FROM chat_agent_models
-                WHERE agent = ?
-                ON CONFLICT(chat_id, agent) DO NOTHING
-                """,
-                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
-            )
-            conn.execute(
-                "DELETE FROM chat_agent_models WHERE agent = ?",
-                (LEGACY_AGENT_GEMINI,),
-            )
-
-            conn.execute(
-                """
-                INSERT INTO chat_agent_turns (chat_id, agent, turn_count, updated_at)
-                SELECT chat_id, ?, turn_count, updated_at
-                FROM chat_agent_turns
-                WHERE agent = ?
-                ON CONFLICT(chat_id, agent) DO UPDATE SET
-                    turn_count = MAX(chat_agent_turns.turn_count, excluded.turn_count),
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (AGENT_ANTIGRAVITY, LEGACY_AGENT_GEMINI),
-            )
-            conn.execute(
-                "DELETE FROM chat_agent_turns WHERE agent = ?",
-                (LEGACY_AGENT_GEMINI,),
             )
             conn.commit()
 
@@ -798,13 +725,8 @@ class CliTextRunner:
         env = dict(os.environ)
         env.setdefault("NO_COLOR", "1")
         if self.label == AGENT_ANTIGRAVITY:
-            trust_workspace = read_env_with_legacy(
-                "ANTIGRAVITY_CLI_TRUST_WORKSPACE",
-                "GEMINI_CLI_TRUST_WORKSPACE",
-                "true",
-            )
+            trust_workspace = os.getenv("ANTIGRAVITY_CLI_TRUST_WORKSPACE", "true").strip()
             env.setdefault("ANTIGRAVITY_CLI_TRUST_WORKSPACE", trust_workspace)
-            env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", trust_workspace)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -902,45 +824,11 @@ class TelegramCodexBot:
             )
             claude_permission_mode = "acceptEdits"
 
-        antigravity_bin = read_env_with_legacy(
-            "ANTIGRAVITY_BIN",
-            "GEMINI_BIN",
-            AGENT_ANTIGRAVITY,
-        )
-        legacy_gemini_bin = os.getenv("GEMINI_BIN", LEGACY_AGENT_GEMINI).strip() or LEGACY_AGENT_GEMINI
-        if (
-            not shutil.which(antigravity_bin)
-            and antigravity_bin != legacy_gemini_bin
-            and shutil.which(legacy_gemini_bin)
-        ):
-            self.logger.warning(
-                "ANTIGRAVITY_BIN=%s is not found; falling back to GEMINI_BIN=%s",
-                antigravity_bin,
-                legacy_gemini_bin,
-            )
-            antigravity_bin = legacy_gemini_bin
-        antigravity_model = read_env_with_legacy(
-            "ANTIGRAVITY_MODEL",
-            "GEMINI_MODEL",
-            "gemini-3-pro-preview",
-        )
-        antigravity_extra_args = shlex.split(
-            read_env_with_legacy(
-                "ANTIGRAVITY_EXTRA_ARGS",
-                "GEMINI_EXTRA_ARGS",
-                "",
-            )
-        )
-        antigravity_timeout = read_int_env_with_legacy(
-            "ANTIGRAVITY_TIMEOUT_SEC",
-            "GEMINI_TIMEOUT_SEC",
-            codex_timeout,
-        )
-        antigravity_approval_mode = read_env_with_legacy(
-            "ANTIGRAVITY_APPROVAL_MODE",
-            "GEMINI_APPROVAL_MODE",
-            "yolo",
-        )
+        antigravity_bin = os.getenv("ANTIGRAVITY_BIN", "agy").strip() or "agy"
+        antigravity_model = os.getenv("ANTIGRAVITY_MODEL", "").strip()
+        antigravity_extra_args = shlex.split(os.getenv("ANTIGRAVITY_EXTRA_ARGS", ""))
+        antigravity_timeout = int(os.getenv("ANTIGRAVITY_TIMEOUT_SEC", str(codex_timeout)))
+        antigravity_approval_mode = os.getenv("ANTIGRAVITY_APPROVAL_MODE", "yolo").strip()
 
         telegram_api_timeout = float(os.getenv("TELEGRAM_API_TIMEOUT_SEC", "30"))
         telegram_send_retries = int(os.getenv("TELEGRAM_SEND_RETRIES", "3"))
@@ -1596,12 +1484,12 @@ class TelegramCodexBot:
         return (
             "[Routing]\n"
             "category=code\n"
-            "pipeline=codex(implement) -> claude(review/fix) -> gemini(assist)\n\n"
+            "pipeline=codex(implement) -> claude(review/fix) -> antigravity(assist)\n\n"
             "[Codex]\n"
             f"{codex_result}\n\n"
             "[Claude]\n"
             f"{claude_result}\n\n"
-            "[Gemini]\n"
+            "[Antigravity]\n"
             f"{antigravity_result}"
         )
 
@@ -1682,13 +1570,13 @@ class TelegramCodexBot:
 
         if codex_exc and antigravity_exc:
             raise RuntimeError(
-                f"collector failed: codex={codex_exc}; gemini={antigravity_exc}"
+                f"collector failed: codex={codex_exc}; antigravity={antigravity_exc}"
             )
 
         if not codex_result:
             codex_result = f"Codex collector failed: {codex_exc}"
         if not antigravity_result:
-            antigravity_result = f"Gemini collector failed: {antigravity_exc}"
+            antigravity_result = f"Antigravity collector failed: {antigravity_exc}"
 
         claude_prompt = self._build_claude_validation_prompt(
             user_text=user_text,
@@ -1706,7 +1594,7 @@ class TelegramCodexBot:
         return (
             "[Routing]\n"
             "category=survey\n"
-            "pipeline=gemini+codex(collect) -> claude(validate/judge)\n\n"
+            "pipeline=antigravity+codex(collect) -> claude(validate/judge)\n\n"
             "[Final by Claude]\n"
             f"{claude_result}"
         )

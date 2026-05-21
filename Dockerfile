@@ -6,9 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs npm ripgrep && \
-    npm install -g @openai/codex @anthropic-ai/claude-code @google/gemini-cli && \
-    ln -sf "$(command -v gemini)" /usr/local/bin/antigravity && \
+    apt-get install -y --no-install-recommends nodejs npm ripgrep curl ca-certificates && \
+    npm install -g @openai/codex @anthropic-ai/claude-code && \
+    curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

@@ -4,7 +4,7 @@ This bot orchestrates three local CLIs:
 
 - `codex`
 - `claude`
-- `antigravity` (legacy alias: `gemini`)
+- `antigravity` (CLI: `agy`)
 
 Task routing policy:
 
@@ -27,7 +27,6 @@ For stable restarts, keep these mounted:
 - `/root/.claude` (Claude auth/session)
 - `/root/.claude.json` (Claude CLI config file)
 - `/root/.antigravity` (Antigravity auth/session)
-- `/root/.gemini` (legacy Gemini auth/session; fallback compatibility)
 - `/app/data` (chat session DB, uploads, generated files)
 
 If `/root/.claude.json` is missing but `/root/.claude/backups` exists, `docker-entrypoint.sh` restores the latest backup automatically.
@@ -53,8 +52,7 @@ Main optional vars:
 - `CODEX_BIN`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`, `CODEX_WORKDIR`, `CODEX_TIMEOUT_SEC`
 - `CODEX_SYSTEM_PROMPT`
 - `CLAUDE_BIN`, `CLAUDE_MODEL` (default: `claude-sonnet-4-6`), `CLAUDE_EXTRA_ARGS`, `CLAUDE_TIMEOUT_SEC`, `CLAUDE_PERMISSION_MODE` (default: `acceptEdits`)
-- `ANTIGRAVITY_BIN`, `ANTIGRAVITY_MODEL` (default: `gemini-3-pro-preview`), `ANTIGRAVITY_EXTRA_ARGS`, `ANTIGRAVITY_TIMEOUT_SEC`, `ANTIGRAVITY_APPROVAL_MODE`, `ANTIGRAVITY_CLI_TRUST_WORKSPACE` (default: `true`)
-- legacy env compatibility: `GEMINI_*` is still accepted as fallback
+- `ANTIGRAVITY_BIN` (default: `agy`), `ANTIGRAVITY_MODEL` (default: CLI default), `ANTIGRAVITY_EXTRA_ARGS`, `ANTIGRAVITY_TIMEOUT_SEC`, `ANTIGRAVITY_APPROVAL_MODE`, `ANTIGRAVITY_CLI_TRUST_WORKSPACE` (default: `true`)
 - `UPLOAD_DIR`, `GENERATED_FILES_DIR`, `MAX_RETURN_FILES`, `MAX_RETURN_FILE_SIZE_MB`
 - `SESSION_DB_PATH`
 - `SESSION_COMPACT_EVERY_TURNS` (default: `5`, auto compact per agent session)
@@ -73,13 +71,13 @@ Model resolution priority (per agent):
 ```bash
 codex login status
 claude auth status
-antigravity
+agy --version
 ```
 
 For `antigravity`, a quick headless check also works:
 
 ```bash
-antigravity --prompt "Reply with exactly: OK" --output-format text
+agy --prompt "Reply with exactly: OK" --output-format text
 ```
 
 ## 3) Start with Docker Compose
@@ -111,7 +109,6 @@ docker run -d \
   -v "$HOME/.codex:/root/.codex" \
   -v "$HOME/.claude:/root/.claude" \
   -v "$HOME/.antigravity:/root/.antigravity" \
-  -v "$HOME/.gemini:/root/.gemini" \
   --restart unless-stopped \
   telegram-openai-bot:local
 ```
@@ -164,11 +161,11 @@ docker stop telegram-openai-bot && docker rm telegram-openai-bot
 - `/model` (show codex/claude/antigravity effective models and sources)
 - `/model <name>` (legacy: set codex model)
 - `/model clear` (legacy: clear codex override)
-- `/model <agent> <name>` (`agent`: `codex|claude|antigravity` - `gemini` alias accepted)
+- `/model <agent> <name>` (`agent`: `codex|claude|antigravity`)
 - `/model <agent> clear`
 - `/session` (show mapped session IDs + per-agent turn counters)
 - `/reset` (clear all mapped sessions)
-- `/reset <agent>` (clear mapped session for `codex|claude|antigravity`; `gemini` alias accepted)
+- `/reset <agent>` (clear mapped session for `codex|claude|antigravity`)
 - `/reset all` (same as `/reset`)
 - `/whoami`
 

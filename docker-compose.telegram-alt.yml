@@ -11,7 +11,6 @@ services:
       - ${HOME}/.codex:/root/.codex
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.antigravity:/root/.antigravity
-      - ${HOME}/.gemini:/root/.gemini
       - type: bind
         source: ${HOME}/.claude.json
         target: /root/.claude.json
